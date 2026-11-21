@@ -162,7 +162,10 @@ export async function startServer(options = {}) {
         fail('Route not found', 404);
       }
       if (url.pathname.startsWith('/tools/')) {
-        if (!secretEqual(req.headers.authorization, config.TOOL_TOKEN ? `Bearer ${config.TOOL_TOKEN}` : '')) fail('Tool authentication required', 401);
+        // Tools accept the bearer token, or a call from Sarvam's documented egress IPs as reported by the Cloudflare tunnel.
+        // ponytail: any Sarvam customer shares these IPs; attach the bearer token to the tools in Sarvam and unset SARVAM_IPS after the demo.
+        const fromSarvam = (config.SARVAM_IPS ?? '').split(',').map(x => x.trim()).filter(Boolean).includes(req.headers['cf-connecting-ip']);
+        if (!fromSarvam && !secretEqual(req.headers.authorization, config.TOOL_TOKEN ? `Bearer ${config.TOOL_TOKEN}` : '')) fail('Tool authentication required', 401);
         if (req.method === 'GET' && url.pathname === '/tools/authority') return respond(res, 200, db.authority(url.searchParams.get('taskId'), url.searchParams.get('offerId'), Number(url.searchParams.get('offerVersion'))));
         if (req.method !== 'POST') fail('Route not found', 404);
         const input = coerce(await readJson(req));

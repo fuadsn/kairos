@@ -299,3 +299,9 @@ test('flat voice-tool strings are coerced into typed fields; unknown charges sta
   const o = coerce({ basePrice: 'Rs 2200', fees: 'unknown', taxes: '', offerVersion: '2', accepted: 'true' });
   assert.deepEqual([o.basePrice, o.fees, o.taxes, o.offerVersion, o.accepted], [2200, null, null, 2, true]);
 });
+
+test('tools accept an allow-listed Sarvam IP in place of the bearer token, and nothing else', async t => {
+  const h = await harness(t, { SARVAM_IPS: '4.213.167.70' });
+  const call = ip => fetch(h.app.url + '/tools/confirm-brief', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(ip ? { 'CF-Connecting-IP': ip } : {}) }, body: '{}' }).then(r => r.status);
+  assert.equal(await call(), 401); assert.equal(await call('1.2.3.4'), 401); assert.notEqual(await call('4.213.167.70'), 401);
+});
