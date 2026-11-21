@@ -288,4 +288,6 @@ test('open links by default; expired task links stop resolving', async t => {
   assert.equal((await h.request(`/api/tasks/${taskId}`)).status, 200);
   h.app.db.sql.prepare('UPDATE tasks SET created_at=? WHERE id=?').run('2020-01-01T00:00:00.000Z', taskId);
   assert.equal((await h.request(`/api/tasks/${taskId}`)).status, 404);
+  await h.app.close(); h.app = await startServer(h.options); // purge runs at boot
+  for (const table of ['tasks', 'events', 'participants', 'notifications']) assert.equal(h.app.db.sql.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n, 0, table);
 });

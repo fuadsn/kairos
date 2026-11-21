@@ -80,7 +80,8 @@ export function openDb(path, config = {}) {
       data TEXT NOT NULL, state TEXT NOT NULL, simulated INTEGER NOT NULL, created_at TEXT NOT NULL
     );
     CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT,'Events are append-only'); END;
-    CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT,'Events are append-only'); END;
+    DROP TRIGGER IF EXISTS events_no_delete;
+    CREATE TRIGGER events_no_delete BEFORE DELETE ON events WHEN EXISTS(SELECT 1 FROM tasks WHERE id=OLD.task_id) BEGIN SELECT RAISE(ABORT,'Events are append-only'); END;
     CREATE TABLE IF NOT EXISTS questions (
       id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), task_revision INTEGER NOT NULL,
       participant_id TEXT NOT NULL REFERENCES participants(id), attempt_id TEXT NOT NULL REFERENCES call_attempts(id),
@@ -231,6 +232,16 @@ export function openDb(path, config = {}) {
   }
   const db = {
     sql, close: () => sql.close(), task, attempt, participant: participantId => get('SELECT * FROM participants WHERE id=?', participantId),
+    // Hard-deletes tasks older than the TTL with every row that references them. Events stay append-only while their task exists.
+    purgeExpired(ttlHours) {
+      const ids = all('SELECT id FROM tasks WHERE created_at < ?', new Date(Date.now() - ttlHours * 3600e3).toISOString()).map(r => r.id);
+      if (!ids.length) return ids;
+      const tables = all("SELECT name FROM sqlite_master WHERE type='table' AND name<>'tasks'").map(r => r.name).filter(n => all(`PRAGMA table_info(${n})`).some(c => c.name === 'task_id'));
+      sql.exec('PRAGMA foreign_keys=OFF');
+      try { for (const taskId of ids) { run('DELETE FROM tasks WHERE id=?', taskId); for (const t of tables) run(`DELETE FROM ${t} WHERE task_id=?`, taskId); } }
+      finally { sql.exec('PRAGMA foreign_keys=ON'); }
+      return ids;
+    },
     bySubdomain: label => get('SELECT id FROM tasks WHERE subdomain=?', label)?.id,
     setLayout(taskId, layout) { run('UPDATE tasks SET layout=? WHERE id=?', json(layout), taskId); },
     createDraft(input) {

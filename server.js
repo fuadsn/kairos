@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { readFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync, rmSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
@@ -117,9 +117,8 @@ export async function startServer(options = {}) {
           return respond(res, 200, { ok: true }, { 'Set-Cookie': `kairos_session=${result.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800${secure}` });
         }
         const cookie = req.headers.cookie?.split(';').map(s => s.trim()).find(s => s.startsWith('kairos_session='))?.slice(15);
-        // ponytail: expiry only hides the task; rows stay in the local DB until the file is deleted. Add real deletion if this outlives the demo.
         const row = db.task(taskId);
-        if (Date.now() - Date.parse(row.created_at) > Number(config.TASK_TTL_HOURS || 24) * 3600e3) fail('This task link has expired.', 404);
+        if (Date.now() - Date.parse(row.created_at) > Number(config.TASK_TTL_HOURS || 24) * 3600e3) fail('This task link has expired.', 404); // purge runs each minute; this covers the gap
         // Open links by default (owner's decision for the demo); REQUIRE_OTP=1 restores phone verification.
         const owner = config.REQUIRE_OTP === '1' ? db.authenticate(taskId, cookie) : row.owner_phone;
         if (!owner) return respond(res, 401, { error: 'Verify your phone to open this private task.' });
@@ -183,6 +182,8 @@ export async function startServer(options = {}) {
   const url = `http://127.0.0.1:${address.port}`;
   if (!config.PUBLIC_URL) config.PUBLIC_URL = url;
   db.recover();
+  const purge = () => { for (const taskId of db.purgeExpired(Number(config.TASK_TTL_HOURS || 24))) rmSync(join(uploadsRoot, taskId), { recursive: true, force: true }); };
+  purge(); const purgeTimer = setInterval(purge, 60_000); purgeTimer.unref();
   timer = setInterval(tick, options.workerInterval ?? 100);
   return { server, db, config, url, tick,
     async close() {
