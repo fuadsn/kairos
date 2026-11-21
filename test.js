@@ -705,7 +705,7 @@ test('owner call: real dispatch sends the owner app, exact string variables and 
   await h.ok('/tools/offer', { taskId: unknown, attemptId: a.id, ...quote, fees: null, upfront: null });
   await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, { attempt_id: a.provider_attempt_id, status: 'connected' }); await ticks(h);
   const unknownTerms = calls().at(-1).body.app_config.agent_variables.proposed_terms;
-  assert.match(unknownTerms, /total not stated/); assert.match(unknownTerms, /fees not stated/); assert.match(unknownTerms, /upfront not stated/);
+  assert.match(unknownTerms, /at least 2000 rupees, .*not stated/); assert.match(unknownTerms, /fees not stated/); assert.match(unknownTerms, /upfront amount not stated/);
 });
 
 test('owner decision: simulated dispatch, exact approval, idempotency, auth and validation', async t => {
@@ -760,8 +760,8 @@ test('owner decision: later, counter and stop reuse owner operations and limits'
 
 test('owner decision: unknown charges are spoken honestly and approval is refused', async t => {
   const { h, input, call } = await ownerReady(t, {}, { fees: null, taxes: null, deposit: null, upfront: null });
-  assert.match(call.payload.variables.proposed_terms, /total not stated/);
-  for (const field of ['fees','taxes','deposit','upfront']) assert.ok(call.payload.variables.proposed_terms.includes(`${field} not stated`));
+  assert.match(call.payload.variables.proposed_terms, /at least 2000 rupees, .*not stated/);
+  assert.match(call.payload.variables.proposed_terms, /fees and taxes not stated, upfront amount not stated/);
   assert.match(call.payload.variables.proposed_problems, /Unknown charges/);
   const response = await h.request('/tools/owner-decision', input);
   assert.equal(response.status, 200); assert.equal(response.data.ok, 'false'); assert.match(response.data.result, /Unknown charges/);

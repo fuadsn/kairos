@@ -292,8 +292,14 @@ export function openDb(path, config = {}) {
     return {
       taskId: t.id, offer_id: proposed.id, offer_version: String(proposed.version), request_summary: t.outcome,
       proposed_supplier: proposed.supplier,
-      proposed_terms: `${spec}, total ${amount(proposed.total)} (base price ${amount(terms.basePrice)}, fees ${amount(terms.fees)}, taxes ${amount(terms.taxes)}), deposit ${amount(terms.deposit)}, upfront ${amount(terms.upfront)}, ready by ${deadline}. Conditions: ${terms.conditions.length ? terms.conditions.join('; ') : 'none'}.`,
-      proposed_problems: proposed.reasons.join(' '),
+      // Spoken aloud: lead with the money, keep it to one short sentence, and never turn an unstated charge into zero.
+      proposed_terms: (() => {
+        const parts = [['base price', terms.basePrice], ['fees', terms.fees], ['taxes', terms.taxes]], known = parts.filter(([, v]) => v != null), missing = parts.filter(([, v]) => v == null).map(([k]) => k);
+        const total = proposed.total != null ? `total ${proposed.total} rupees` : known.length ? `at least ${known.reduce((n, [, v]) => n + v, 0)} rupees, ${missing.join(' and ')} not stated` : 'price not stated';
+        const upfront = `${terms.upfront != null ? `${terms.upfront} rupees upfront` : 'upfront amount not stated'}${terms.deposit ? `, ${terms.deposit} rupees deposit` : ''}`;
+        return `${spec}: ${total}, ${upfront}, ready by ${deadline}.${terms.conditions.length ? ` Conditions: ${terms.conditions.join('; ')}.` : ''}`;
+      })(),
+      proposed_problems: proposed.reasons.slice(0, 2).join(' '),
       other_quotes: offers.filter(o => o.id !== proposed.id).map(o => `${o.supplier}: total ${amount(o.total)}.`).join(' '),
       suggestion: t.advice?.summary || '', may_counter: String(!!proposed.canCounter), language: t.language
     };
