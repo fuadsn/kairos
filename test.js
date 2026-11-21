@@ -12,7 +12,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const brief = overrides => ({ ownerPhone: '+910000000000', language: 'English', type: 'appointment', mode: 'arrangement', outcome: 'Print and deliver 100 flyers', hardConstraints: ['100 flyers'], preferences: [], deadline: '2030-12-01T12:00:00+05:30', timezone: 'Asia/Kolkata', budgetMax: 2500, discloseBudget: false, mayCounter: true, contacts: [{ name: 'Printer A', phone: '+910000000001' }, { name: 'Printer B', phone: '+910000000002' }], unresolved: [], ...overrides });
 async function harness(t, config = {}, workerInterval = 2) {
   const dir = mkdtempSync(join(tmpdir(), 'kairos-test-'));
-  const options = { port: 0, workerInterval, uploadsRoot: join(dir, 'uploads'), config: { DB_PATH: join(dir, 'test.db'), PORT: '0', PUBLIC_URL: '', TOOL_TOKEN, WEBHOOK_SECRET, SARVAM_API_KEY: '', SMS_GATEWAY_URL: '', THINKER: '', MAX_ATTEMPTS: '6', SIM_DELAY_MS: '0', ...config } };
+  const options = { port: 0, workerInterval, uploadsRoot: join(dir, 'uploads'), config: { DB_PATH: join(dir, 'test.db'), PORT: '0', PUBLIC_URL: '', TOOL_TOKEN, WEBHOOK_SECRET, SARVAM_API_KEY: '', SMS_GATEWAY_URL: '', THINKER: '', REQUIRE_OTP: '1', MAX_ATTEMPTS: '6', SIM_DELAY_MS: '0', ...config } };
   const h = { app: null, dir, options };
   try { h.app = await startServer(options); } catch (error) { rmSync(dir, { recursive: true, force: true }); throw error; }
   t.after(async () => { await h.app.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -281,4 +281,11 @@ test('subdomain resolves same private page and fixed layouts reject untrusted bl
   const layout = await layoutFor(brief()); assert.deepEqual(validateLayout(layout), layout);
   assert.throws(() => validateLayout([{ type: 'script', props: { html: '<script>' } }]));
   assert.throws(() => validateLayout([...layout, { type: 'upload', props: { onClick: 'evil' } }]));
+});
+
+test('open links by default; expired task links stop resolving', async t => {
+  const h = await harness(t, { REQUIRE_OTP: '' }), taskId = await h.create();
+  assert.equal((await h.request(`/api/tasks/${taskId}`)).status, 200);
+  h.app.db.sql.prepare('UPDATE tasks SET created_at=? WHERE id=?').run('2020-01-01T00:00:00.000Z', taskId);
+  assert.equal((await h.request(`/api/tasks/${taskId}`)).status, 404);
 });

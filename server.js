@@ -117,7 +117,11 @@ export async function startServer(options = {}) {
           return respond(res, 200, { ok: true }, { 'Set-Cookie': `kairos_session=${result.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800${secure}` });
         }
         const cookie = req.headers.cookie?.split(';').map(s => s.trim()).find(s => s.startsWith('kairos_session='))?.slice(15);
-        const owner = db.authenticate(taskId, cookie);
+        // ponytail: expiry only hides the task; rows stay in the local DB until the file is deleted. Add real deletion if this outlives the demo.
+        const row = db.task(taskId);
+        if (Date.now() - Date.parse(row.created_at) > Number(config.TASK_TTL_HOURS || 24) * 3600e3) fail('This task link has expired.', 404);
+        // Open links by default (owner's decision for the demo); REQUIRE_OTP=1 restores phone verification.
+        const owner = config.REQUIRE_OTP === '1' ? db.authenticate(taskId, cookie) : row.owner_phone;
         if (!owner) return respond(res, 401, { error: 'Verify your phone to open this private task.' });
         if (req.method === 'GET' && !operation) return respond(res, 200, db.view(taskId));
         if (req.method !== 'POST') fail('Route not found', 404);
