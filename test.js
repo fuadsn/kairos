@@ -8,7 +8,7 @@ import { startServer, coerce } from './server.js';
 import { validateLayout, layoutFor, ruleAdvice, validateAdvice, research, advise, nextAction } from './thinker.js';
 
 import { openDb, suitability, callingTime, indianPhone } from './db.js';
-import { supplierVariables, flat, simulate } from './sarvam.js';
+import { supplierVariables, flat, simulate, placeOwnerCall, placeCall } from './sarvam.js';
 
 const TOOL_TOKEN = 'test-only-tool-token', WEBHOOK_SECRET = 'test-only-webhook-secret';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -629,4 +629,264 @@ test('open question keeps Needs you while a re-call is queued; demo supplier rep
   await h.ok('/tools/offer', { taskId, attemptId: a.id, spec: 'cake', basePrice: '900', fees: '100', taxes: '0', deposit: '0', upfront: '200' });
   const who = await h.ok('/tools/identify', { phone: '+919999900001' });
   assert.match(who.status_summary, /only if the caller asks: Quotes so far: Ryan: total 1000 rupees, 200 upfront/);
+});
+
+const ownerKeys = ['taskId','offer_id','offer_version','request_summary','proposed_supplier','proposed_terms','proposed_problems','other_quotes','suggestion','may_counter','language'];
+const ownerActions = (db, taskId) => db.sql.prepare("SELECT * FROM actions WHERE task_id=? AND kind='owner_call' ORDER BY id").all(taskId).map(a => ({ ...a, payload: JSON.parse(a.payload) }));
+async function ticks(h, count = 8) { for (let i = 0; i < count; i++) await h.app.tick(); }
+async function ownerReady(t, config = {}, terms = {}) {
+  const h = await harness(t, { SIM_DELAY_MS: '600000', OWNER_CALL_DELAY_MS: '0', SARVAM_IPS: '', ...config }, 100000);
+  const taskId = await h.create({ contacts: [{ name: 'Printer A', phone: '+910000000001' }] });
+  await h.ok('/tools/confirm-brief', { taskId }); await ticks(h);
+  const a = h.attempt(taskId);
+  const offer = await h.ok('/tools/offer', { taskId, attemptId: a.id, ...quote, ...terms });
+  await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, { attempt_id: a.provider_attempt_id, status: 'connected' });
+  await ticks(h);
+  const input = { taskId, offerId: offer.offerId, offerVersion: String(offer.offerVersion), decision: 'approve' };
+  return { h, taskId, offer, input, call: ownerActions(h.app.db, taskId).at(-1) };
+}
+
+test('owner call: real dispatch sends the owner app, exact string variables and one call per offer set', async t => {
+  const sent = [];
+  const gateway = http.createServer(async (req, res) => {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    sent.push({ url: req.url, key: req.headers['x-api-key'], body: JSON.parse(Buffer.concat(chunks)) });
+    res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ attempt_id: `fake-sarvam-${sent.length}` }));
+  });
+  await new Promise((resolve, reject) => { gateway.once('error', reject); gateway.listen(0, '127.0.0.1', resolve); });
+  t.after(async () => { await new Promise(resolve => { gateway.close(resolve); gateway.closeIdleConnections(); }); });
+  const h = await harness(t, { SARVAM_API_KEY: 'test-key', SARVAM_ORG_ID: 'test-org', SARVAM_WORKSPACE_ID: 'test-workspace', SARVAM_SUPPLIER_APP_ID: 'supplier-app', SARVAM_SUPPLIER_APP_VERSION: '1', SARVAM_OWNER_APP_ID: 'owner-app', SARVAM_OWNER_APP_VERSION: '2', SARVAM_CONNECTION_ID: 'test-connection', SARVAM_AGENT_NUMBER: '+910000000009', OWNER_CALL_DELAY_MS: '0' }, 100000, {
+    sarvamFetch: (url, options) => {
+      assert.equal(new URL(url).origin, 'https://apps.sarvam.ai');
+      return fetch(`http://127.0.0.1:${gateway.address().port}${new URL(url).pathname}`, options);
+    }, advise: async () => ({ recommendOfferId: null, counterOfferId: null, counterAsk: null, summary: 'Review these offers.' })
+  });
+  const taskId = await h.create({ contacts: [...brief().contacts, { name: 'Printer C', phone: '+910000000003' }] });
+  await h.ok('/tools/confirm-brief', { taskId });
+  for (const terms of [{ basePrice: 2200 }, { basePrice: 2000 }, { basePrice: 1000, fees: null }]) {
+    await ticks(h);
+    const a = h.attempt(taskId);
+    await h.ok('/tools/offer', { taskId, attemptId: a.id, ...quote, ...terms });
+    await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, { attempt_id: a.provider_attempt_id, status: 'connected' });
+  }
+  await ticks(h);
+  const calls = () => sent.filter(x => x.body.webhook_config.metadata.kind === 'owner_call');
+  assert.equal(calls().length, 1);
+  const request = calls()[0], body = request.body, variables = body.app_config.agent_variables;
+  assert.equal(request.url, '/api/outbounds/v1/orgs/test-org/workspaces/test-workspace/outbounds'); assert.equal(request.key, 'test-key');
+  assert.equal(body.app_config.app_id, 'owner-app'); assert.equal(body.app_config.app_version, 2);
+  assert.deepEqual(body.app_config.connection_config, { connection_id: 'test-connection', agent_phone_number: '+910000000009' });
+  assert.deepEqual(body.user_config, { user_phone_number: brief().ownerPhone });
+  assert.equal(body.webhook_config.url, `${h.app.url}/webhooks/sarvam?token=${WEBHOOK_SECRET}`);
+  assert.deepEqual(Object.keys(variables).sort(), ownerKeys.slice().sort()); assert.ok(Object.values(variables).every(x => typeof x === 'string'));
+  assert.equal(variables.proposed_supplier, 'Printer B'); assert.equal(variables.proposed_problems, ''); assert.equal(variables.may_counter, 'true');
+  assert.match(variables.other_quotes, /Printer C: total not stated/); assert.equal(variables.suggestion, 'Review these offers.');
+  const call = ownerActions(h.app.db, taskId)[0];
+  assert.equal(call.status, 'done'); assert.equal(call.payload.attemptId, 'fake-sarvam-4');
+  assert.deepEqual(body.webhook_config.metadata, { taskId, actionId: String(call.id), kind: 'owner_call' });
+  const attempts = h.app.db.sql.prepare('SELECT * FROM call_attempts WHERE task_id=?').all(taskId);
+  const completion = { attempt_id: call.payload.attemptId, status: 'no_answer', webhook_config: body.webhook_config };
+  assert.deepEqual(await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, completion), { duplicate: false });
+  const events = h.app.db.view(taskId).events;
+  assert.equal(events.at(-1).text, "You did not answer Kairos's call; the decision is waiting on your link.");
+  assert.deepEqual(await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, completion), { duplicate: true });
+  assert.deepEqual(h.app.db.view(taskId).events, events); assert.equal(h.app.db.task(taskId).state, 'Needs you');
+  assert.deepEqual(h.app.db.sql.prepare('SELECT * FROM call_attempts WHERE task_id=?').all(taskId), attempts);
+  const proposed = h.app.db.view(taskId).offers.find(o => o.id === variables.offer_id);
+  await h.ok('/tools/offer', { taskId, attemptId: proposed.attempt_id, ...proposed.terms });
+  h.app.db.recover(); await ticks(h); assert.equal(calls().length, 1);
+  await h.ok('/tools/offer', { taskId, attemptId: proposed.attempt_id, ...proposed.terms, basePrice: 1900 });
+  await ticks(h); assert.equal(calls().length, 2); assert.equal(calls()[1].body.app_config.agent_variables.offer_version, '2');
+  // Real provider dispatch evidence also authorises the exact voice decision.
+  assert.deepEqual(await h.ok('/tools/owner-decision', { taskId, offerId: proposed.id, offerVersion: '2', decision: 'approve' }), { ok: 'true', result: 'Approved. I will now ask the supplier to confirm.' });
+  const unknown = await h.create({ contacts: [{ name: 'Unknown fees', phone: '+910000000008' }] });
+  await h.ok('/tools/confirm-brief', { taskId: unknown }); await ticks(h);
+  const a = h.attempt(unknown);
+  await h.ok('/tools/offer', { taskId: unknown, attemptId: a.id, ...quote, fees: null, upfront: null });
+  await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, { attempt_id: a.provider_attempt_id, status: 'connected' }); await ticks(h);
+  const unknownTerms = calls().at(-1).body.app_config.agent_variables.proposed_terms;
+  assert.match(unknownTerms, /total not stated/); assert.match(unknownTerms, /fees not stated/); assert.match(unknownTerms, /upfront not stated/);
+});
+
+test('owner decision: simulated dispatch, exact approval, idempotency, auth and validation', async t => {
+  const { h, taskId, input, call } = await ownerReady(t);
+  assert.equal(call.payload.simulated, true); assert.equal(call.status, 'done');
+  assert.ok(h.app.db.view(taskId).events.some(e => e.text === 'Simulated call to the owner with the result.'));
+  assert.equal((await h.request('/tools/owner-decision', input, undefined, 'POST', { Authorization: '' })).status, 401);
+  for (const changes of [{ decision: 'yes' }, { offerVersion: 'version 1' }, { offerVersion: '-1' }, { offerVersion: 1 }]) assert.equal((await h.request('/tools/owner-decision', { ...input, ...changes })).status, 400);
+  const denied = await h.request('/tools/owner-decision', { ...input, offerVersion: '2' });
+  assert.equal(denied.status, 403); assert.equal(denied.data.error, 'No owner call is in progress for these terms');
+  const expected = { ok: 'true', result: 'Approved. I will now ask the supplier to confirm.' };
+  assert.deepEqual(await h.ok('/tools/owner-decision', { ...input, decision: ' Approve ' }), expected);
+  const approval = h.app.db.sql.prepare('SELECT * FROM approvals WHERE task_id=?').get(taskId);
+  assert.equal(approval.owner_phone, brief().ownerPhone); assert.equal(h.app.db.task(taskId).state, 'Awaiting confirmation');
+  assert.deepEqual(await h.ok('/tools/owner-decision', input), expected);
+  assert.equal(h.app.db.sql.prepare('SELECT count(*) n FROM approvals WHERE task_id=?').get(taskId).n, 1);
+  assert.equal(h.app.db.sql.prepare("SELECT count(*) n FROM actions WHERE task_id=? AND type='call' AND json_extract(payload,'$.purpose')='confirm'").get(taskId).n, 1);
+  assert.deepEqual(h.app.db.view(taskId).events.filter(e => e.kind === 'approved').map(e => e.text), ["Approved by voice on Kairos's call to the owner."]);
+  await ticks(h); assert.equal(h.attempt(taskId, 'confirm').purpose, 'confirm');
+  h.app.db.stop(taskId);
+  assert.equal(h.app.db.authority(taskId, input.offerId, 1).ok, false);
+  assert.deepEqual(await h.ok('/tools/owner-decision', input), { ok: 'false', result: 'Task was stopped' });
+});
+
+test('owner decision: no dispatch or expired evidence is forbidden', async t => {
+  const { h, taskId, input, call } = await ownerReady(t, { OWNER_CALL_DELAY_MS: '600000' });
+  assert.equal(call.status, 'queued');
+  assert.equal((await h.request('/tools/owner-decision', input)).status, 403);
+  h.app.db.sql.prepare('UPDATE actions SET due_at=0 WHERE id=?').run(call.id); await ticks(h);
+  const payload = ownerActions(h.app.db, taskId)[0].payload;
+  payload.dispatchedAt = Date.now() - 31 * 60_000;
+  h.app.db.sql.prepare('UPDATE actions SET payload=? WHERE id=?').run(JSON.stringify(payload), call.id);
+  assert.equal((await h.request('/tools/owner-decision', input)).status, 403);
+});
+
+test('owner decision: later, counter and stop reuse owner operations and limits', async t => {
+  const { h, taskId, input } = await ownerReady(t);
+  assert.deepEqual(await h.ok('/tools/owner-decision', { ...input, decision: 'later' }), { ok: 'true', result: 'You can decide later on your link.' });
+  assert.equal(h.app.db.task(taskId).state, 'Needs you'); assert.ok(h.app.db.view(taskId).events.some(e => e.text === 'Owner will decide later on the link.'));
+  assert.equal((await h.ok('/tools/owner-decision', { ...input, decision: 'counter' })).ok, 'true');
+  assert.equal(h.app.db.sql.prepare("SELECT count(*) n FROM actions WHERE task_id=? AND type='call' AND status='queued' AND json_extract(payload,'$.purpose')='counter'").get(taskId).n, 1);
+  assert.equal((await h.ok('/tools/owner-decision', { ...input, decision: 'counter' })).ok, 'false');
+  await ticks(h);
+  const a = h.attempt(taskId, 'counter');
+  await h.ok('/tools/offer', { taskId, attemptId: a.id, ...quote, basePrice: 1900 });
+  await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, { attempt_id: a.provider_attempt_id, status: 'connected' }); await ticks(h);
+  assert.equal(ownerActions(h.app.db, taskId).at(-1).payload.variables.may_counter, 'false');
+  const next = { ...input, offerVersion: '2' };
+  assert.deepEqual(await h.ok('/tools/owner-decision', { ...next, decision: 'counter' }), { ok: 'false', result: 'Only one counteroffer round is permitted per supplier' });
+  assert.equal((await h.ok('/tools/owner-decision', { ...next, decision: 'stop' })).ok, 'true'); assert.equal(h.app.db.task(taskId).stopped, true);
+});
+
+test('owner decision: unknown charges are spoken honestly and approval is refused', async t => {
+  const { h, input, call } = await ownerReady(t, {}, { fees: null, taxes: null, deposit: null, upfront: null });
+  assert.match(call.payload.variables.proposed_terms, /total not stated/);
+  for (const field of ['fees','taxes','deposit','upfront']) assert.ok(call.payload.variables.proposed_terms.includes(`${field} not stated`));
+  assert.match(call.payload.variables.proposed_problems, /Unknown charges/);
+  const response = await h.request('/tools/owner-decision', input);
+  assert.equal(response.status, 200); assert.equal(response.data.ok, 'false'); assert.match(response.data.result, /Unknown charges/);
+});
+
+// These owner-call tests exercise the same durable operations without requiring sockets.
+function storeOwnerReady(t, config = {}) {
+  const h = storeHarness(t, { SIM_DELAY_MS: '600000', OWNER_CALL_DELAY_MS: '0', ...config });
+  const taskId = h.create({ contacts: [{ name: 'Printer A', phone: '+910000000001' }] }); h.db.confirmBrief(taskId); h.drain();
+  const a = h.db.sql.prepare('SELECT * FROM call_attempts WHERE task_id=?').get(taskId);
+  const offer = h.db.offer({ taskId, attemptId: a.id, ...quote }); h.db.sarvamWebhook({ attempt_id: a.provider_attempt_id, status: 'connected' });
+  // Leave the owner action unclaimed for explicit dispatch/race tests.
+  let action = h.db.claim(); assert.equal(action.type, 'think'); h.db.adviceResult(action, ruleAdvice(h.db.view(taskId)));
+  action = h.db.claim(); assert.equal(action.type, 'notify'); h.db.finishAction(action.id);
+  return { ...h, taskId, offer, a, input: { taskId, offerId: offer.offerId, offerVersion: offer.offerVersion, decision: 'approve' } };
+}
+
+test('store: owner dispatch cancels after revision, stop, changed offers or a pending supplier call', t => {
+  for (const change of ['revision','stop','offer','counter']) {
+    const { db, taskId, a, offer } = storeOwnerReady(t);
+    const action = db.claim(); assert.equal(action.type, 'owner_call');
+    if (change === 'revision') db.revise(taskId, { outcome: 'Print 200 flyers' });
+    else if (change === 'stop') db.stop(taskId);
+    else if (change === 'offer') db.offer({ taskId, attemptId: a.id, ...quote, basePrice: 1800 });
+    else db.counter(taskId, { offerId: offer.offerId });
+    const before = db.view(taskId).events.length;
+    assert.equal(db.prepareOwnerCall(action), null);
+    assert.equal(ownerActions(db, taskId)[0].status, 'cancelled'); assert.equal(db.view(taskId).events.length, before);
+  }
+});
+
+test('store: owner callbacks dedupe, preserve supplier attempts and task state, including callback-before-response', t => {
+  const { db, taskId, settings } = storeOwnerReady(t);
+  Object.assign(settings, { SARVAM_API_KEY: 'fake-key', SARVAM_OWNER_APP_ID: 'owner', SARVAM_OWNER_APP_VERSION: '1' });
+  const action = db.claim(), call = db.prepareOwnerCall(action); assert.ok(call);
+  const before = db.sql.prepare('SELECT * FROM call_attempts WHERE task_id=?').all(taskId), state = db.task(taskId).state;
+  const payload = { attempt_id: 'owner-attempt', status: 'no_answer', webhook_config: { metadata: { taskId, actionId: String(action.id), kind: 'owner_call' } } };
+  assert.deepEqual(db.sarvamWebhook(payload), { duplicate: false });
+  const events = db.view(taskId).events; assert.equal(events.at(-1).text, "You did not answer Kairos's call; the decision is waiting on your link.");
+  assert.deepEqual(db.sarvamWebhook(payload), { duplicate: true }); assert.deepEqual(db.view(taskId).events, events);
+  assert.deepEqual(db.sql.prepare('SELECT * FROM call_attempts WHERE task_id=?').all(taskId), before); assert.equal(db.task(taskId).state, state);
+  db.ownerCallDispatched(action.id, { attemptId: 'owner-attempt' }); db.ownerCallFailed(action.id, Object.assign(new Error('timeout'), { uncertain: true }));
+  assert.equal(ownerActions(db, taskId)[0].payload.attemptId, 'owner-attempt'); assert.equal(ownerActions(db, taskId)[0].status, 'done');
+  assert.throws(() => db.sarvamWebhook({ ...payload, attempt_id: 'different-attempt' }), /cannot be correlated/);
+});
+
+test('store: owner call config, delay, restart uncertainty and decision authority', t => {
+  for (const missing of ['SARVAM_OWNER_APP_ID','SARVAM_OWNER_APP_VERSION']) {
+    const { db, taskId, settings, input } = storeOwnerReady(t);
+    Object.assign(settings, { SARVAM_API_KEY: 'fake', SARVAM_OWNER_APP_ID: 'owner', SARVAM_OWNER_APP_VERSION: '1', [missing]: '' });
+    assert.equal(db.prepareOwnerCall(db.claim()), null); assert.equal(ownerActions(db, taskId)[0].status, 'done');
+    assert.equal(db.view(taskId).events.at(-1).text, 'Owner call-back is not configured.');
+    assert.throws(() => db.ownerDecision(input), /No owner call is in progress/);
+  }
+  const { db, taskId, settings, input } = storeOwnerReady(t, { OWNER_CALL_DELAY_MS: '20000' });
+  const queued = ownerActions(db, taskId)[0]; assert.ok(queued.due_at >= Date.parse(queued.created_at) + 19999); assert.equal(db.claim(), null);
+  db.sql.prepare('UPDATE actions SET due_at=0 WHERE id=?').run(queued.id);
+  Object.assign(settings, { SARVAM_API_KEY: 'fake', SARVAM_OWNER_APP_ID: 'owner', SARVAM_OWNER_APP_VERSION: '1' });
+  const action = db.claim(); db.prepareOwnerCall(action); db.recover();
+  assert.equal(ownerActions(db, taskId)[0].status, 'uncertain'); assert.equal(db.task(taskId).state, 'Needs you'); assert.equal(db.claim(), null);
+  assert.throws(() => db.ownerDecision(input), /No owner call is in progress/);
+  db.sarvamWebhook({ attempt_id: 'recovered-owner', status: 'connected', webhook_config: { metadata: { taskId, actionId: String(action.id), kind: 'owner_call' } } });
+  assert.equal(db.view(taskId).events.at(-1).text, 'Call to you: connected.');
+  assert.equal(db.ownerDecision(input).ok, 'true'); assert.equal(db.task(taskId).state, 'Awaiting confirmation');
+  const confirmation = db.claim(); assert.equal(confirmation.payload.purpose, 'confirm');
+  db.revise(taskId, { outcome: 'Print 200 flyers' }); assert.equal(db.prepareCall(confirmation), null);
+  assert.throws(() => db.ownerDecision(input), /No owner call is in progress/);
+});
+
+test('store: changed proposed version cannot counter newer terms, and stopped approval cannot dispatch', t => {
+  const { db, taskId, a, input } = storeOwnerReady(t);
+  db.prepareOwnerCall(db.claim());
+  db.offer({ taskId, attemptId: a.id, ...quote, basePrice: 1900 });
+  assert.deepEqual(db.ownerDecision({ ...input, decision: 'counter' }), { ok: 'false', result: 'Offer is no longer current' });
+  assert.deepEqual(db.ownerDecision(input), { ok: 'false', result: 'Offer is no longer current' });
+  const next = storeOwnerReady(t); next.db.prepareOwnerCall(next.db.claim()); next.db.ownerDecision(next.input);
+  const action = next.db.claim(); next.db.stop(next.taskId);
+  assert.equal(next.db.prepareCall(action), null); assert.equal(next.db.authority(next.taskId, next.offer.offerId, 1).ok, false);
+});
+
+test('store: owner offer selection honours advice, suitability, known totals and first-offer fallback', t => {
+  for (const choice of ['advice','suitable','known','first']) {
+    const { db, taskId, a, drain } = storeOwnerReady(t, { OWNER_CALL_DELAY_MS: '600000' });
+    const first = { ...quote, basePrice: choice === 'known' ? 2800 : 2200, ...(choice === 'first' ? { fees: null } : {}) };
+    db.offer({ taskId, attemptId: a.id, ...first });
+    db.contacts(taskId, { add: [{ name: 'Printer B', phone: '+919876543212' }] }); drain();
+    const b = db.sql.prepare('SELECT * FROM call_attempts WHERE task_id=? ORDER BY rowid DESC LIMIT 1').get(taskId);
+    db.offer({ taskId, attemptId: b.id, ...quote, basePrice: choice === 'known' ? 3000 : 2000, ...(choice === 'first' ? { fees: null } : {}) });
+    db.sarvamWebhook({ attempt_id: b.provider_attempt_id, status: 'connected' }); drain();
+    const v = db.view(taskId), firstOffer = v.offers.find(o => o.validity === 'current' && o.supplier === 'Printer A');
+    const think = db.sql.prepare("SELECT * FROM actions WHERE task_id=? AND kind='think' ORDER BY id DESC LIMIT 1").get(taskId);
+    db.adviceResult({ ...think, payload: JSON.parse(think.payload) }, { recommendOfferId: choice === 'advice' ? firstOffer.id : null, counterOfferId: null, counterAsk: null, summary: 'Review the terms.' });
+    const queued = ownerActions(db, taskId).at(-1); db.sql.prepare('UPDATE actions SET due_at=0 WHERE id=?').run(queued.id);
+    db.prepareOwnerCall(db.claim());
+    const variables = ownerActions(db, taskId).at(-1).payload.variables;
+    assert.equal(variables.proposed_supplier, choice === 'suitable' ? 'Printer B' : 'Printer A');
+    assert.deepEqual(Object.keys(variables).sort(), ownerKeys.slice().sort()); assert.ok(Object.values(variables).every(v => typeof v === 'string'));
+    if (choice === 'first') assert.match(variables.proposed_terms, /fees not stated/);
+  }
+});
+
+test('store: Sarvam owner and supplier transport share errors and owner dispatch never retries uncertain delivery', async t => {
+  const { db, taskId, settings, input } = storeOwnerReady(t);
+  Object.assign(settings, { SARVAM_API_KEY: 'fake-key', SARVAM_ORG_ID: 'org', SARVAM_WORKSPACE_ID: 'workspace', SARVAM_OWNER_APP_ID: 'owner-app', SARVAM_OWNER_APP_VERSION: '2', SARVAM_SUPPLIER_APP_ID: 'supplier-app', SARVAM_SUPPLIER_APP_VERSION: '1', SARVAM_CONNECTION_ID: 'connection', SARVAM_AGENT_NUMBER: '+910000000009', PUBLIC_URL: 'https://example.test/', WEBHOOK_SECRET: 'test secret' });
+  const action = db.claim(), call = db.prepareOwnerCall(action);
+  let sent;
+  const result = await placeOwnerCall(call, { ...settings, fetch: async (url, options) => {
+    sent = { url, options, body: JSON.parse(options.body) }; return new Response(JSON.stringify({ attempt_id: 'fake-owner-attempt' }));
+  } });
+  assert.deepEqual(result, { attemptId: 'fake-owner-attempt', simulated: false });
+  assert.equal(sent.options.method, 'POST'); assert.equal(sent.options.headers['X-API-Key'], 'fake-key');
+  assert.equal(sent.body.app_config.app_id, 'owner-app'); assert.equal(sent.body.app_config.app_version, 2);
+  assert.deepEqual(sent.body.app_config.agent_variables, call.variables);
+  assert.equal(sent.body.user_config.user_phone_number, brief().ownerPhone);
+  assert.equal(sent.body.webhook_config.url, 'https://example.test/webhooks/sarvam?token=test%20secret');
+  assert.deepEqual(sent.body.webhook_config.metadata, { taskId, actionId: String(action.id), kind: 'owner_call' });
+  for (const dispatch of [placeOwnerCall, args => placeCall({ ...args, participant: { id: 'supplier', phone: '+910000000001' } }, settings)]) {
+    for (const [status, response, uncertain] of [[400, '{}', false], [503, '{}', true], [200, '{}', true], [200, 'invalid json', true]]) {
+      settings.fetch = async () => new Response(response, { status });
+      await assert.rejects(() => dispatch(call, settings), e => e.uncertain === uncertain);
+    }
+  }
+  db.ownerCallFailed(action.id, Object.assign(new Error('Timed out'), { name: 'TimeoutError' }));
+  assert.equal(ownerActions(db, taskId)[0].status, 'uncertain'); assert.equal(db.task(taskId).state, 'Needs you');
+  assert.throws(() => db.ownerDecision(input), /No owner call is in progress/);
+  db.recover(); assert.equal(db.claim(), null);
+  assert.equal((await placeOwnerCall(call, {})).simulated, true);
 });

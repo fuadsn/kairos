@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { openDb, secretEqual } from './db.js';
 import { send, status as smsStatus } from './sms.js';
-import { placeCall, supplierVariables, simulate } from './sarvam.js';
+import { placeCall, placeOwnerCall, supplierVariables, simulate } from './sarvam.js';
 import { layoutFor, research, advise, ruleAdvice } from './thinker.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
@@ -27,6 +27,7 @@ export function coerce(input) {
   for (const k of ['budgetMax', 'basePrice', 'fees', 'taxes', 'deposit', 'upfront', 'offerVersion', 'minutes']) if (k in out && typeof out[k] !== 'number') out[k] = blank(out[k]) || !/\d/.test(out[k]) ? null : Number(String(out[k]).replace(/[^\d.]/g, ''));
   for (const k of ['mayCounter', 'accepted']) if (typeof out[k] === 'string') out[k] = /^(true|yes|1)$/i.test(out[k].trim());
   if ('discloseBudget' in out) out.discloseBudget = out.discloseBudget === true || out.discloseBudget === 'true';
+  if (typeof out.decision === 'string') out.decision = out.decision.trim().toLowerCase();
   for (const k of ['supplierKind', 'location', 'phone']) if (typeof out[k] === 'string') out[k] = out[k].trim();
   if (typeof out.contacts === 'string') out.contacts = out.contacts.split(/[;\n]/).map(c => { const phone = c.match(/\+?\d[\d\s-]{8,}\d/)?.[0]; return phone && { name: c.replace(phone, '').replace(/[,:|-]+\s*$/, '').trim() || 'Supplier', phone: phone.replace(/[\s-]/g, '').replace(/^(?:0|91)?(\d{10})$/, '+91$1') }; }).filter(Boolean);
   if (!out.existingArrangement && out.existingReference) out.existingArrangement = { reference: out.existingReference, acceptedTerms: out.existingTerms };
@@ -72,8 +73,14 @@ export async function startServer(options = {}) {
         if (prepared) {
           const variables = supplierVariables(prepared.task, prepared.participant, prepared.purpose, prepared);
           db.saveVariables(prepared.attemptId, variables);
-          try { db.dispatched(prepared.attemptId, await placeCall({ ...prepared, variables, actionKey: action.action_key, actionId: action.id }, config)); }
+          try { db.dispatched(prepared.attemptId, await placeCall({ ...prepared, variables, actionKey: action.action_key, actionId: action.id }, { ...config, fetch: options.sarvamFetch })); }
           catch (error) { db.dispatchFailed(prepared.attemptId, error); }
+        }
+      } else if (action.type === 'owner_call') {
+        const call = db.prepareOwnerCall(action);
+        if (call) {
+          try { db.ownerCallDispatched(action.id, await placeOwnerCall(call, { ...config, fetch: options.sarvamFetch })); }
+          catch (error) { db.ownerCallFailed(action.id, error); }
         }
       } else if (action.type === 'research') {
         let result = [];
@@ -185,7 +192,9 @@ export async function startServer(options = {}) {
         if (!fromSarvam && !secretEqual(req.headers.authorization, config.TOOL_TOKEN ? `Bearer ${config.TOOL_TOKEN}` : '')) fail('Tool authentication required', 401);
         if (req.method === 'GET' && url.pathname === '/tools/authority') return respond(res, 200, db.authority(url.searchParams.get('taskId'), url.searchParams.get('offerId'), Number(url.searchParams.get('offerVersion'))));
         if (req.method !== 'POST') fail('Route not found', 404);
-        const input = coerce(await readJson(req));
+        const raw = await readJson(req);
+        if (url.pathname === '/tools/owner-decision' && (!['taskId','offerId','offerVersion','decision'].every(k => typeof raw[k] === 'string') || !/^[1-9]\d*$/.test(raw.offerVersion.trim()))) fail('Expected taskId, offerId, offerVersion and decision as strings, with a positive offerVersion');
+        const input = coerce(raw);
         res.on('finish', () => { if (res.statusCode >= 400) console.error(`[tool rejected] ${url.pathname} ${res.statusCode} keys=${Object.keys(input).join(',')}`); });
         if (url.pathname === '/tools/draft') {
           // DEMO_SUPPLIERS ("Name, +91…; Name, +91…") are the owner's own test contacts: used when the caller names no supplier, and called straight away.
@@ -200,6 +209,7 @@ export async function startServer(options = {}) {
         if (url.pathname === '/tools/question') return respond(res, 200, db.question(input));
         if (url.pathname === '/tools/offer') return respond(res, 200, db.offer(input));
         if (url.pathname === '/tools/acceptance') return respond(res, 200, db.acceptance(input));
+        if (url.pathname === '/tools/owner-decision') return respond(res, 200, db.ownerDecision(input));
         fail('Route not found', 404);
       }
       if (req.method === 'POST' && ['/webhooks/sarvam','/webhooks/sms'].includes(url.pathname)) {

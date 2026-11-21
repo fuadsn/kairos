@@ -22,16 +22,24 @@ const KEYS = ['taskId', 'attemptId', 'purpose', 'request_summary', 'hard_require
 export const flat = v => Object.fromEntries(KEYS.map(k => { const x = k === 'budget_max' ? v.budgetMax : v[k]; return [k, x == null ? '' : typeof x === 'string' ? x : JSON.stringify(x)]; }));
 
 export async function placeCall({ task, participant, purpose, variables, actionKey, actionId }, config = process.env) {
+  return outbound(participant.phone, flat(variables), { taskId: task.id, actionId: String(actionId), participantId: participant.id }, 'SUPPLIER', config);
+}
+
+export async function placeOwnerCall({ task, variables, actionId }, config = process.env) {
+  return outbound(task.owner_phone, variables, { taskId: task.id, actionId: String(actionId), kind: 'owner_call' }, 'OWNER', config);
+}
+
+async function outbound(number, variables, metadata, app, config) {
   if (!config.SARVAM_API_KEY) return { attemptId: `sim-${randomBytes(12).toString('hex')}`, simulated: true };
-  for (const key of ['SARVAM_ORG_ID', 'SARVAM_WORKSPACE_ID', 'SARVAM_SUPPLIER_APP_ID', 'SARVAM_SUPPLIER_APP_VERSION', 'SARVAM_CONNECTION_ID', 'SARVAM_AGENT_NUMBER', 'PUBLIC_URL', 'WEBHOOK_SECRET']) {
+  for (const key of ['SARVAM_ORG_ID', 'SARVAM_WORKSPACE_ID', `SARVAM_${app}_APP_ID`, `SARVAM_${app}_APP_VERSION`, 'SARVAM_CONNECTION_ID', 'SARVAM_AGENT_NUMBER', 'PUBLIC_URL', 'WEBHOOK_SECRET']) {
     if (!config[key]) throw new Error(`Missing ${key}; configure it before calling`);
   }
-  const response = await fetch(`https://apps.sarvam.ai/api/outbounds/v1/orgs/${encodeURIComponent(config.SARVAM_ORG_ID)}/workspaces/${encodeURIComponent(config.SARVAM_WORKSPACE_ID)}/outbounds`, {
+  const response = await (config.fetch || fetch)(`https://apps.sarvam.ai/api/outbounds/v1/orgs/${encodeURIComponent(config.SARVAM_ORG_ID)}/workspaces/${encodeURIComponent(config.SARVAM_WORKSPACE_ID)}/outbounds`, {
     method: 'POST', headers: { 'X-API-Key': config.SARVAM_API_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      app_config: { app_id: config.SARVAM_SUPPLIER_APP_ID, app_version: Number(config.SARVAM_SUPPLIER_APP_VERSION), connection_config: { connection_id: config.SARVAM_CONNECTION_ID, agent_phone_number: config.SARVAM_AGENT_NUMBER }, agent_variables: flat(variables) },
-      user_config: { user_phone_number: participant.phone },
-      webhook_config: { url: `${config.PUBLIC_URL.replace(/\/$/, '')}/webhooks/sarvam?token=${encodeURIComponent(config.WEBHOOK_SECRET)}`, metadata: { taskId: task.id, actionId: String(actionId), participantId: participant.id } }
+      app_config: { app_id: config[`SARVAM_${app}_APP_ID`], app_version: Number(config[`SARVAM_${app}_APP_VERSION`]), connection_config: { connection_id: config.SARVAM_CONNECTION_ID, agent_phone_number: config.SARVAM_AGENT_NUMBER }, agent_variables: variables },
+      user_config: { user_phone_number: number },
+      webhook_config: { url: `${config.PUBLIC_URL.replace(/\/$/, '')}/webhooks/sarvam?token=${encodeURIComponent(config.WEBHOOK_SECRET)}`, metadata }
     }), signal: AbortSignal.timeout(10_000)
   });
   if (!response.ok) { const error = new Error(`Sarvam returned HTTP ${response.status}`); error.uncertain = response.status >= 500; throw error; }
