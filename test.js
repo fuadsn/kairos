@@ -296,7 +296,8 @@ test('flat voice-tool strings are coerced into typed fields; unknown charges sta
   const d = coerce({ ownerPhone: '98765 43210', hardConstraints: '100 flyers; A5', budgetMax: '2,500', mayCounter: 'yes', discloseBudget: 'false', contacts: 'Printer A, 09876543210; Printer B: +91 98765 43211' });
   assert.deepEqual([d.ownerPhone, d.hardConstraints, d.budgetMax, d.mayCounter, d.discloseBudget], ['+919876543210', ['100 flyers', 'A5'], 2500, true, false]);
   assert.deepEqual(d.contacts, [{ name: 'Printer A', phone: '+919876543210' }, { name: 'Printer B', phone: '+919876543211' }]);
-  const o = coerce({ basePrice: 'Rs 2200', fees: 'unknown', taxes: '', offerVersion: '2', accepted: 'true' });
+  const o = coerce({ basePrice: 'Rs 2200', fees: 'unknown', taxes: '', offerVersion: '2', accepted: 'true', conditions: '5000 upfront; none' });
+  assert.deepEqual(o.conditions, ['5000 upfront']);
   assert.deepEqual([o.basePrice, o.fees, o.taxes, o.offerVersion, o.accepted], [2200, null, null, 2, true]);
 });
 
