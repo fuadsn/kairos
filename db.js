@@ -284,6 +284,11 @@ export function openDb(path, config = {}) {
       }
     }
   }
+  function approvalBlocker(terms, fit) {
+    if (fit.total === null) return 'The full price is not known yet. Ask the supplier for the missing charges first.';
+    if (Math.max(terms.upfront || 0, terms.deposit || 0) > fit.total) return 'The upfront amount is more than the total. Ask the supplier to correct the quote first.';
+    return null;
+  }
   function offerFingerprint(v) { return hash(json(v.offers.filter(o => o.validity === 'current' && o.task_revision === v.task.revision).map(o => [o.id, o.version]).sort())); }
   function ownerVariables(t, offers, proposed) {
     const terms = proposed.terms, amount = value => value == null ? 'not stated' : `${value} rupees`;
@@ -513,7 +518,7 @@ export function openDb(path, config = {}) {
       const question = questions.find(q => q.task_revision === t.revision && q.answer === null);
       const currentOffers = offers.filter(o => o.validity === 'current' && o.task_revision === t.revision);
       let currentAction = { type: 'status', text: t.blocked_reason || ({ Draft: 'Confirm the brief with the intake agent to start.', Working: 'Contacting your permitted suppliers, one at a time.', 'Awaiting confirmation': 'Your exact terms are approved. Waiting for the supplier to accept.', 'Awaiting required action': 'A required condition remains. Review the outcome below.', Confirmed: 'The supplier accepted the arrangement. The service itself has not yet been delivered.', Completed: 'Your information is ready. No booking was made.', Stopped: 'Unsent work is stopped. An in-flight call or prior agreement may still need attention.', 'Needs reconciliation': 'An external response conflicts with current authority. Review the evidence with the supplier; no cancellation is claimed.' }[t.state] || 'Review your options.') };
-      if (!t.stopped && t.state === 'Needs you') currentAction = question ? { type: 'question', question } : { type: 'approval', offers: currentOffers.filter(o => o.suitable).map(o => ({ id: o.id, version: o.version })), text: 'Approving authorises Kairos to seek supplier acceptance of exactly these terms. It does not make a payment.' };
+      if (!t.stopped && t.state === 'Needs you') currentAction = question ? { type: 'question', question } : { type: 'approval', offers: currentOffers.filter(o => !approvalBlocker(o.terms, o)).map(o => ({ id: o.id, version: o.version })), text: 'Approving authorises Kairos to seek supplier acceptance of exactly these terms. It does not make a payment.' };
       const notifications = all('SELECT id,kind,status,provider_id,error,retry_status,created_at FROM notifications WHERE task_id=? AND kind<>? ORDER BY created_at', taskId, 'otp');
       const attempts = all('SELECT a.id,a.participant_id,a.purpose,a.status,a.duration,a.failure_reason,a.notes,a.created_at,p.name AS supplier FROM call_attempts a JOIN participants p ON p.id=a.participant_id WHERE a.task_id=? ORDER BY a.created_at', taskId).map(a => ({ ...a, notes: parse(a.notes) }));
       const contacts = all('SELECT id,name,phone,permitted,source,source_url,note FROM participants WHERE task_id=? ORDER BY ordinal', taskId).map(p => ({ ...p, phone: `••••${p.phone.slice(-4)}` }));
@@ -597,12 +602,15 @@ export function openDb(path, config = {}) {
       check(t.type !== 'quote' && t.mode === 'arrangement', 'Information tasks do not require approval');
       const o = offerRow(input.offerId, input.offerVersion), latest = offerRow(input.offerId);
       check(o.task_id === taskId && o.version === latest.version && o.task_revision === t.revision && o.validity === 'current', 'Offer is no longer current');
-      const fit = suitability(t, o.terms); check(fit.suitable, fit.reasons.join(' '));
+      // The owner decides on budget and preferences, so warnings can be overridden by an explicit approval of exact terms.
+      // Two things cannot: a price that is not fully known, and an upfront amount larger than the total.
+      const fit = suitability(t, o.terms), blocker = approvalBlocker(o.terms, fit);
+      check(!blocker, blocker);
       check(!get('SELECT 1 FROM questions WHERE task_id=? AND task_revision=? AND answer IS NULL', taskId, t.revision), 'Answer the pending question first');
       run('UPDATE approvals SET valid=0 WHERE task_id=?', taskId);
       const approvalId = id();
       run('INSERT INTO approvals(id,task_id,task_revision,offer_id,offer_version,owner_phone,terms,created_at) VALUES(?,?,?,?,?,?,?,?)', approvalId, taskId, t.revision, o.id, o.version, ownerPhone, json(o.terms), now());
-      event(taskId, 'approved', byVoice ? "Approved by voice on Kairos's call to the owner." : `Owner approved exact offer version ${o.version}.`, { approvalId, offerId: o.id, version: o.version, terms: o.terms });
+      event(taskId, 'approved', `${byVoice ? "Approved by voice on Kairos's call to the owner." : `Owner approved exact offer version ${o.version}.`}${fit.suitable ? '' : ` Approved despite: ${fit.reasons.join(' ')}`}`, { approvalId, offerId: o.id, version: o.version, terms: o.terms, acknowledged: fit.reasons });
       queueCall(taskId, o.participant_id, 'confirm', { offerId: o.id, offerVersion: o.version, approvalId });
       return { approvalId };
     },
@@ -617,8 +625,7 @@ export function openDb(path, config = {}) {
       if (!p?.permitted) return { ok: false, reason: 'Contact permission was revoked' };
       const approval = get('SELECT * FROM approvals WHERE task_id=? AND task_revision=? AND offer_id=? AND offer_version=? AND valid=1', taskId, t.revision, offerId, Number(version));
       if (!approval || approval.owner_phone !== t.owner_phone || approval.terms !== o.terms) return { ok: false, reason: 'No valid owner approval for these exact terms' };
-      const fit = suitability(t, parse(o.terms));
-      return { ok: fit.suitable, reason: fit.suitable ? 'Current owner approval matches these exact terms' : fit.reasons.join(' ') };
+      return { ok: true, reason: 'Current owner approval matches these exact terms' };
     },
     acceptance(input) {
       const { a, t, p } = source(input, true);

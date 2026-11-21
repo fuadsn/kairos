@@ -764,7 +764,7 @@ test('owner decision: unknown charges are spoken honestly and approval is refuse
   assert.match(call.payload.variables.proposed_terms, /fees and taxes not stated, upfront amount not stated/);
   assert.match(call.payload.variables.proposed_problems, /Unknown charges/);
   const response = await h.request('/tools/owner-decision', input);
-  assert.equal(response.status, 200); assert.equal(response.data.ok, 'false'); assert.match(response.data.result, /Unknown charges/);
+  assert.equal(response.status, 200); assert.equal(response.data.ok, 'false'); assert.match(response.data.result, /full price is not known yet/);
 });
 
 // These owner-call tests exercise the same durable operations without requiring sockets.
@@ -889,4 +889,19 @@ test('store: Sarvam owner and supplier transport share errors and owner dispatch
   assert.throws(() => db.ownerDecision(input), /No owner call is in progress/);
   db.recover(); assert.equal(db.claim(), null);
   assert.equal((await placeOwnerCall(call, {})).simulated, true);
+});
+
+test('owner may approve a fully priced quote that is over budget; the warnings they accepted are recorded', async t => {
+  const h = await harness(t, { SIM_DELAY_MS: '600000' }), taskId = await h.create({ budgetMax: 1000, contacts: [{ name: 'Ryan', phone: '+910000000001' }] });
+  await h.ok('/tools/confirm-brief', { taskId });
+  let a; for (let i = 0; i < 300 && !(a = h.app.db.sql.prepare('SELECT * FROM call_attempts WHERE task_id=? AND provider_attempt_id IS NOT NULL').get(taskId)); i++) await sleep(10);
+  const o = await h.ok('/tools/offer', { taskId, attemptId: a.id, spec: '1 kg Black Forest cake', basePrice: '5000', fees: '0', taxes: '0', deposit: 'unknown', upfront: '0', conditions: 'all inclusive' });
+  assert.equal(o.suitable, false);
+  await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, { attempt_id: a.provider_attempt_id, status: 'connected' });
+  const cookie = await h.login(taskId), v = await h.view(taskId, cookie);
+  assert.deepEqual(v.currentAction.offers, [{ id: o.offerId, version: 1 }]);
+  await h.ok(`/api/tasks/${taskId}/approve`, { offerId: o.offerId, offerVersion: 1 }, cookie);
+  assert.equal(h.app.db.task(taskId).state, 'Awaiting confirmation');
+  assert.match((await h.view(taskId, cookie)).events.find(e => e.kind === 'approved').text, /Approved despite: .*exceeds the ₹1000 budget/);
+  assert.equal(h.app.db.authority(taskId, o.offerId, 1).ok, true);
 });
