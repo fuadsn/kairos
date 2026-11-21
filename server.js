@@ -4,7 +4,7 @@ import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { openDb, secretEqual } from './db.js';
-import { send } from './sms.js';
+import { send, status as smsStatus } from './sms.js';
 import { placeCall, supplierVariables, simulate } from './sarvam.js';
 import { layoutFor } from './thinker.js';
 
@@ -24,7 +24,7 @@ export function loadEnv(path = join(root, '.env')) {
 export function coerce(input) {
   const out = { ...input }, blank = v => v == null || /^(|unknown|null|none|not stated)$/i.test(String(v).trim());
   for (const k of ['hardConstraints', 'preferences', 'unresolved', 'unknown']) if (typeof out[k] === 'string') out[k] = out[k].split(/[;\n]/).map(x => x.trim()).filter(x => x && !blank(x));
-  for (const k of ['budgetMax', 'basePrice', 'fees', 'taxes', 'deposit', 'upfront', 'offerVersion']) if (k in out && typeof out[k] !== 'number') out[k] = blank(out[k]) || !/\d/.test(out[k]) ? null : Number(String(out[k]).replace(/[^\d.]/g, ''));
+  for (const k of ['budgetMax', 'basePrice', 'fees', 'taxes', 'deposit', 'upfront', 'offerVersion', 'minutes']) if (k in out && typeof out[k] !== 'number') out[k] = blank(out[k]) || !/\d/.test(out[k]) ? null : Number(String(out[k]).replace(/[^\d.]/g, ''));
   for (const k of ['discloseBudget', 'mayCounter', 'accepted']) if (typeof out[k] === 'string') out[k] = /^(true|yes|1)$/i.test(out[k].trim());
   if (typeof out.contacts === 'string') out.contacts = out.contacts.split(/[;\n]/).map(c => { const phone = c.match(/\+?\d[\d\s-]{8,}\d/)?.[0]; return phone && { name: c.replace(phone, '').replace(/[,:|-]+\s*$/, '').trim() || 'Supplier', phone: phone.replace(/[\s-]/g, '').replace(/^(?:0|91)?(\d{10})$/, '+91$1') }; }).filter(Boolean);
   if (!out.existingArrangement && out.existingReference) out.existingArrangement = { reference: out.existingReference, acceptedTerms: out.existingTerms };
@@ -61,6 +61,10 @@ export async function startServer(options = {}) {
         const notification = db.notification(action.action_key);
         const result = await send(db.task(action.task_id).owner_phone, notification.body, action.action_key, config);
         db.notificationResult(action, result);
+        if (result.status === 'handed_to_phone' && result.messageId) setTimeout(async () => {
+          const m = await smsStatus(result.messageId, config), event = m.state === 'Failed' ? 'sms:failed' : m.state === 'Delivered' ? 'sms:delivered' : null;
+          try { if (event) db.smsWebhook({ event, payload: { messageId: result.messageId, phoneNumber: m.phoneNumber, reason: m.reason } }); } catch { /* server closing or already recorded */ }
+        }, Number(config.SMS_CHECK_MS ?? 4000)).unref();
       } else if (action.type === 'call') {
         prepared = db.prepareCall(action);
         if (prepared) {
@@ -175,6 +179,7 @@ export async function startServer(options = {}) {
           return respond(res, 201, result);
         }
         if (url.pathname === '/tools/confirm-brief') return respond(res, 200, db.confirmBrief(input.taskId));
+        if (url.pathname === '/tools/callback') return respond(res, 200, db.callback(input));
         if (url.pathname === '/tools/question') return respond(res, 200, db.question(input));
         if (url.pathname === '/tools/offer') return respond(res, 200, db.offer(input));
         if (url.pathname === '/tools/acceptance') return respond(res, 200, db.acceptance(input));

@@ -144,6 +144,7 @@ export function openDb(path, config = {}) {
     CREATE TABLE IF NOT EXISTS sessions (
       token_hash TEXT PRIMARY KEY, owner_phone TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at TEXT NOT NULL
     );`);
+  for (const col of ['callback_at INTEGER', 'callback_done INTEGER NOT NULL DEFAULT 0']) { try { sql.exec(`ALTER TABLE call_attempts ADD COLUMN ${col}`); } catch { /* already present */ } }
   const get = (q, ...args) => sql.prepare(q).get(...args);
   const all = (q, ...args) => sql.prepare(q).all(...args);
   const run = (q, ...args) => sql.prepare(q).run(...args);
@@ -205,8 +206,8 @@ export function openDb(path, config = {}) {
       check(!get("SELECT 1 FROM call_attempts WHERE task_id=? AND participant_id=? AND purpose='counter'", taskId, participantId), 'Only one counteroffer round is permitted per supplier');
     }
     if (purpose === 'confirm') check(db.authority(taskId, payload.offerId, payload.offerVersion).ok, 'Approval is no longer valid');
-    const key = `${taskId}:r${t.revision}:${purpose}:${participantId}:${payload.questionId || payload.offerVersion || 'initial'}`;
-    enqueue(taskId, 'call', key, { participantId, purpose, ...payload });
+    const key = `${taskId}:r${t.revision}:${purpose}:${participantId}:${payload.questionId || payload.offerVersion || (payload.callbackOf ? `cb${payload.callbackOf}` : 'initial')}`;
+    enqueue(taskId, 'call', key, { participantId, purpose, ...payload }, payload.dueAt || 0);
     state(taskId, purpose === 'confirm' ? 'Awaiting confirmation' : 'Working');
     if (payload.questionId) run('UPDATE questions SET resumed=1 WHERE id=?', payload.questionId);
     event(taskId, 'call_queued', `${purpose === 'confirm' ? 'Seeking exact-term confirmation from' : purpose === 'counter' ? 'Asking for a better offer from' : 'Preparing to call'} ${p.name}.`, { participantId, purpose });
@@ -215,6 +216,8 @@ export function openDb(path, config = {}) {
     const t = task(taskId);
     if (t.stopped || ['Draft','Awaiting confirmation','Awaiting required action','Confirmed','Completed','Needs reconciliation','Blocked'].includes(t.state)) return;
     if (get(`SELECT 1 FROM call_attempts WHERE task_id=? AND status IN ${activeAttempt}`, taskId) || get("SELECT 1 FROM actions WHERE task_id=? AND type='call' AND status IN ('queued','in_flight')", taskId)) return;
+    const cb = get('SELECT * FROM call_attempts WHERE task_id=? AND task_revision=? AND callback_at IS NOT NULL AND callback_done=0 ORDER BY created_at LIMIT 1', taskId, t.revision);
+    if (cb) { run('UPDATE call_attempts SET callback_done=1 WHERE id=?', cb.id); queueCall(taskId, cb.participant_id, 'collect_offer', { callbackOf: cb.id, dueAt: cb.callback_at }); return; }
     const v = db.view(taskId);
     const action = nextAction({ ...v, offers: v.offers.filter(o => o.task_revision === t.revision), questions: v.questions.filter(q => q.task_revision === t.revision), participants: all('SELECT * FROM participants WHERE task_id=? AND permitted=1 ORDER BY ordinal', taskId), attempts: all('SELECT * FROM call_attempts WHERE task_id=? AND task_revision=?', taskId, t.revision) });
     if (action.type === 'call_supplier') queueCall(taskId, action.participantId, action.purpose, { ...(action.questionId ? { questionId: action.questionId } : {}) });
@@ -288,6 +291,15 @@ export function openDb(path, config = {}) {
       return { task: { ...publicTask, notifications, attempts, maskedPhone: `••••${owner_phone.slice(-4)}` }, layout, currentAction, offers, questions,
         events: all('SELECT * FROM events WHERE task_id=? ORDER BY id', taskId).map(e => ({ ...e, data: parse(e.data), simulated: !!e.simulated })), outcome: t.outcomeRecord,
         uploads: all('SELECT id,filename,content_type,size,created_at FROM uploads WHERE task_id=? ORDER BY created_at', taskId), simulated: t.simulated };
+    },
+    // Supplier asked to be called later. Kairos calls back itself; the supplier cannot reach this task by phoning in.
+    callback(input) {
+      const { a, t, p } = source(input);
+      const minutes = Math.min(720, Math.max(1, Number(input.minutes) || 10)), at = Date.now() + minutes * 60_000;
+      if (a.callback_at) return { callbackAt: new Date(a.callback_at).toISOString() };
+      run('UPDATE call_attempts SET callback_at=? WHERE id=?', at, a.id);
+      event(t.id, 'callback_requested', `${p.name} asked to be called back${input.when ? ` (${text(input.when, 'when', 200)})` : ''}. Kairos will call again in about ${minutes} minutes.`, { attemptId: a.id, callbackAt: at });
+      return { callbackAt: new Date(at).toISOString() };
     },
     question(input) {
       const { a, t, p } = source(input); const questionText = text(input.text, 'question');
@@ -560,9 +572,9 @@ export function openDb(path, config = {}) {
     if (payload.payload.phoneNumber && !secretEqual(task(notification.task_id).owner_phone, payload.payload.phoneNumber)) return;
     if (notification.status === 'delivered') return;
     const delivered = payload.event === 'sms:delivered';
-    run('UPDATE notifications SET status=?,error=? WHERE id=?', delivered ? 'delivered' : 'failed', delivered ? null : 'Phone reported SMS delivery failure', notification.id);
+    run('UPDATE notifications SET status=?,error=? WHERE id=?', delivered ? 'delivered' : 'failed', delivered ? null : `Phone reported SMS failure${payload.payload.reason ? `: ${String(payload.payload.reason).slice(0, 200)}` : ''}`, notification.id);
   }
-  for (const name of ['setLayout','createDraft','confirmBrief','question','answer','offer','counter','approve','acceptance','revise','stop','sarvamWebhook','smsWebhook','requestOtp','verifyOtp','addUpload','claim','prepareCall','saveVariables','dispatched','dispatchFailed','notificationResult','finishAction','uncertainAction','recover']) {
+  for (const name of ['setLayout','createDraft','confirmBrief','callback','question','answer','offer','counter','approve','acceptance','revise','stop','sarvamWebhook','smsWebhook','requestOtp','verifyOtp','addUpload','claim','prepareCall','saveVariables','dispatched','dispatchFailed','notificationResult','finishAction','uncertainAction','recover']) {
     const fn = db[name]; db[name] = (...args) => atomic(() => fn(...args));
   }
   return db;

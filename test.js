@@ -305,3 +305,15 @@ test('tools accept an allow-listed Sarvam IP in place of the bearer token, and n
   const call = ip => fetch(h.app.url + '/tools/confirm-brief', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(ip ? { 'CF-Connecting-IP': ip } : {}) }, body: '{}' }).then(r => r.status);
   assert.equal(await call(), 401); assert.equal(await call('1.2.3.4'), 401); assert.notEqual(await call('4.213.167.70'), 401);
 });
+
+test('supplier asks to be called later: a re-call is scheduled instead of blocking', async t => {
+  const h = await harness(t, { SIM_DELAY_MS: '600000' }), taskId = await h.create({ contacts: [{ name: 'Printer A', phone: '+910000000001' }] });
+  await h.ok('/tools/confirm-brief', { taskId });
+  let attempt; for (let i = 0; i < 200 && !(attempt = h.app.db.sql.prepare('SELECT * FROM call_attempts WHERE task_id=? AND provider_attempt_id IS NOT NULL').get(taskId)); i++) await sleep(10);
+  const r = await h.ok('/tools/callback', { taskId, attemptId: attempt.id, when: 'after lunch', minutes: '30' });
+  assert.ok(Date.parse(r.callbackAt) > Date.now() + 29 * 60_000);
+  await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, { attempt_id: attempt.provider_attempt_id, status: 'connected' });
+  const queued = h.app.db.sql.prepare("SELECT * FROM actions WHERE task_id=? AND type='call' AND status='queued'").get(taskId);
+  assert.ok(queued && queued.due_at > Date.now() + 29 * 60_000, 'callback call queued for later');
+  assert.equal(h.app.db.task(taskId).state, 'Working');
+});
