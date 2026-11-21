@@ -20,6 +20,17 @@ export function loadEnv(path = join(root, '.env')) {
     process.env[match[1]] = value;
   }
 }
+// Voice-agent tools send flat strings; turn them into the typed fields the task operations expect.
+export function coerce(input) {
+  const out = { ...input }, blank = v => v == null || /^(|unknown|null|none|not stated)$/i.test(String(v).trim());
+  for (const k of ['hardConstraints', 'preferences', 'unresolved', 'unknown']) if (typeof out[k] === 'string') out[k] = out[k].split(/[;\n]/).map(x => x.trim()).filter(x => x && !blank(x));
+  for (const k of ['budgetMax', 'basePrice', 'fees', 'taxes', 'deposit', 'upfront', 'offerVersion']) if (k in out && typeof out[k] !== 'number') out[k] = blank(out[k]) || !/\d/.test(out[k]) ? null : Number(String(out[k]).replace(/[^\d.]/g, ''));
+  for (const k of ['discloseBudget', 'mayCounter', 'accepted']) if (typeof out[k] === 'string') out[k] = /^(true|yes|1)$/i.test(out[k].trim());
+  if (typeof out.contacts === 'string') out.contacts = out.contacts.split(/[;\n]/).map(c => { const phone = c.match(/\+?\d[\d\s-]{8,}\d/)?.[0]; return phone && { name: c.replace(phone, '').replace(/[,:|-]+\s*$/, '').trim() || 'Supplier', phone: phone.replace(/[\s-]/g, '').replace(/^(?:0|91)?(\d{10})$/, '+91$1') }; }).filter(Boolean);
+  if (!out.existingArrangement && out.existingReference) out.existingArrangement = { reference: out.existingReference, acceptedTerms: out.existingTerms };
+  if (typeof out.ownerPhone === 'string') out.ownerPhone = out.ownerPhone.replace(/[\s-]/g, '').replace(/^(?:0|91)?(\d{10})$/, '+91$1');
+  return out;
+}
 function fail(message, status = 400) { const error = new Error(message); error.status = status; throw error; }
 async function body(req, max = 128 * 1024) {
   if (Number(req.headers['content-length'] || 0) > max) fail('Request body is too large', 413);
@@ -150,7 +161,7 @@ export async function startServer(options = {}) {
         if (!secretEqual(req.headers.authorization, config.TOOL_TOKEN ? `Bearer ${config.TOOL_TOKEN}` : '')) fail('Tool authentication required', 401);
         if (req.method === 'GET' && url.pathname === '/tools/authority') return respond(res, 200, db.authority(url.searchParams.get('taskId'), url.searchParams.get('offerId'), Number(url.searchParams.get('offerVersion'))));
         if (req.method !== 'POST') fail('Route not found', 404);
-        const input = await readJson(req);
+        const input = coerce(await readJson(req));
         if (url.pathname === '/tools/draft') {
           const result = db.createDraft(input);
           db.setLayout(result.taskId, await layoutFor(db.task(result.taskId), config.THINKER));

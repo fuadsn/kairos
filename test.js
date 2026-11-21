@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import http from 'node:http';
-import { startServer } from './server.js';
+import { startServer, coerce } from './server.js';
 import { validateLayout, layoutFor } from './thinker.js';
 
 const TOOL_TOKEN = 'test-only-tool-token', WEBHOOK_SECRET = 'test-only-webhook-secret';
@@ -290,4 +290,12 @@ test('open links by default; expired task links stop resolving', async t => {
   assert.equal((await h.request(`/api/tasks/${taskId}`)).status, 404);
   await h.app.close(); h.app = await startServer(h.options); // purge runs at boot
   for (const table of ['tasks', 'events', 'participants', 'notifications']) assert.equal(h.app.db.sql.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n, 0, table);
+});
+
+test('flat voice-tool strings are coerced into typed fields; unknown charges stay null', () => {
+  const d = coerce({ ownerPhone: '98765 43210', hardConstraints: '100 flyers; A5', budgetMax: '2,500', mayCounter: 'yes', discloseBudget: 'false', contacts: 'Printer A, 09876543210; Printer B: +91 98765 43211' });
+  assert.deepEqual([d.ownerPhone, d.hardConstraints, d.budgetMax, d.mayCounter, d.discloseBudget], ['+919876543210', ['100 flyers', 'A5'], 2500, true, false]);
+  assert.deepEqual(d.contacts, [{ name: 'Printer A', phone: '+919876543210' }, { name: 'Printer B', phone: '+919876543211' }]);
+  const o = coerce({ basePrice: 'Rs 2200', fees: 'unknown', taxes: '', offerVersion: '2', accepted: 'true' });
+  assert.deepEqual([o.basePrice, o.fees, o.taxes, o.offerVersion, o.accepted], [2200, null, null, 2, true]);
 });
