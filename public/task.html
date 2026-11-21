@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow"><meta name="referrer" content="no-referrer">
+<title>Kairos · Private task</title>
+<style>
+:root{font:17px/1.55 system-ui,sans-serif;color:#222c29;background:#f4f3ef;--accent:#216350}*{box-sizing:border-box}body{margin:0}main{max-width:760px;margin:auto;padding:26px 20px 80px}h1{font-size:clamp(1.7rem,6vw,2.3rem);line-height:1.2;margin:12px 0}h2{font-size:1.2rem;margin:0 0 14px}h3{font-size:1.05rem;margin:0}p{margin:10px 0}section{padding:24px 0;border-bottom:1px solid #d8ddd7}.brand{letter-spacing:.15em;text-transform:uppercase;font-size:.8rem;font-weight:700;color:var(--accent)}.muted,small{color:#58635e}.tag{display:inline-block;padding:3px 10px;border:1px solid #b9c9bf;border-radius:4px;font-size:.85rem;margin:4px 8px 4px 0}.focus{background:#e8f0ea;padding:22px;border:1px solid #aabeb0;border-radius:10px;margin:22px 0}.card{background:#fff;border:1px solid #d5dbd5;border-radius:8px;padding:18px;margin:12px 0}.reason{font-weight:600;border-left:3px solid #6f7565;padding-left:12px}.price{font-size:1.5rem;font-weight:650}.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}button,input,textarea{font:inherit}button{cursor:pointer;border:1px solid var(--accent);border-radius:6px;background:var(--accent);color:#fff;min-height:46px;padding:10px 16px;margin:8px 8px 2px 0}button.secondary{background:transparent;color:var(--accent)}button:disabled{opacity:.55;cursor:wait}label{display:block;font-weight:600;margin-top:12px}input,textarea{display:block;width:100%;padding:11px;border:1px solid #87988e;border-radius:5px;background:#fff;margin:7px 0}textarea{min-height:90px}details{margin:12px 0}summary{cursor:pointer;color:var(--accent)}ul{padding-left:22px}li{margin:7px 0}.error{color:#713820;background:#fff0e9;padding:12px;border-radius:5px}#message:empty{display:none}.line{white-space:pre-wrap;overflow-wrap:anywhere}.timeline{list-style:none;padding:0}.timeline li{border-left:2px solid #cdd9ce;padding:4px 0 12px 16px}footer{margin-top:28px}.quiet{font-size:.9rem}a{color:var(--accent)}:focus-visible{outline:3px solid #8ab7a4;outline-offset:3px}
+</style>
+</head>
+<body><main><div class="brand">Kairos / your task</div><p id="message" class="error" role="alert"></p><div id="auth"></div><div id="page" aria-live="polite"></div><footer class="muted quiet">A private record of what was requested, discussed and agreed.</footer></main>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const el=(tag,value,cls)=>{const n=document.createElement(tag);if(value!==undefined)n.textContent=String(value);if(cls)n.className=cls;return n;};
+let taskId=location.pathname.match(/^\/t\/([a-f0-9]{32})$/)?.[1],view=null,last='',authenticated=false,polling=false;
+const money=n=>n===null||n===undefined?'Not stated':`₹${n.toLocaleString('en-IN')}`;
+const date=s=>s?new Date(s).toLocaleString():'Not stated';
+const string=v=>typeof v==='string'?v:JSON.stringify(v);
+function button(label,fn,secondary=false){const b=el('button',label,secondary?'secondary':'');b.type='button';b.addEventListener('click',async()=>{b.disabled=true;try{$('message').textContent='';await fn();await poll(true);}catch(e){$('message').textContent=e.message;}finally{b.disabled=false;}});return b;}
+async function api(path='',data,method='POST',headers={}){
+ const res=await fetch(`/api/tasks/${taskId}${path}`,{method,headers:{...(data!==undefined?{'Content-Type':'application/json'}:{}),...headers},...(data!==undefined?{body:JSON.stringify(data)}:{})});
+ const result=await res.json();if(!res.ok){const e=new Error(result.error||'Request failed');e.status=res.status;throw e;}return result;
+}
+function field(parent,label,value='',kind='input'){const name=`field-${Math.random().toString(16).slice(2)}`,l=el('label',label),n=el(kind);l.htmlFor=name;n.id=name;n.value=value;parent.append(l,n);return n;}
+function auth(){
+ if($('auth').childNodes.length)return;
+ const box=el('section');box.append(el('h1','Your private task'),el('p','Verify your phone to see the request and respond.'));
+ const note=el('p','Request a code sent to the task owner’s phone.');box.append(note);
+ const request=button('Send access code',async()=>{const r=await api('/otp/request',{});note.textContent=`Enter the code we sent to ${r.maskedPhone}.${r.simulated?' SMS is simulated: the code appears in the server console.':''}`;request.textContent='Send another code';});
+ box.append(request);const code=field(box,'6-digit access code');code.inputMode='numeric';code.autocomplete='one-time-code';code.maxLength=6;
+ box.append(button('Open private task',async()=>{await api('/otp/verify',{code:code.value});authenticated=true;$('auth').replaceChildren();await poll(true);}));$('auth').append(box);
+}
+function facts(parent,offer){
+ const t=offer.terms;parent.append(el('p',`Total ${money(offer.total)}`,'price'));
+ parent.append(el('p',`Base ${money(t.basePrice)} · Fees ${money(t.fees)} · Taxes ${money(t.taxes)}`,'quiet'));
+ parent.append(el('p',`Upfront ${money(t.upfront)} · Deposit ${money(t.deposit)}`));
+ parent.append(el('p',`Timing: ${t.availability||'Not stated'} · Deadline: ${date(t.deadline)}`));
+ parent.append(el('p',`Scope: ${string(t.spec)}`,'line'));
+ parent.append(el('p',`Conditions: ${t.conditions.length?t.conditions.map(string).join('; '):'None stated'}`));
+ if(offer.missing.length)parent.append(el('p',`Missing details: ${offer.missing.join(', ')}`));
+ for(const reason of offer.reasons)parent.append(el('p',reason,'reason'));
+}
+const blocks={
+ header(section){const t=view.task;section.append(el('span',`Revision ${t.revision}`,'tag'));if(view.simulated)section.append(el('span','Simulated calls','tag'));section.append(el('h1',t.outcome),el('p',`Status: ${t.state}`),el('p',view.currentAction.text||'A supplier needs your answer.'),el('small',`Last update ${date(t.updated_at)}`));
+ for(const n of t.notifications.slice(-3))section.append(el('p',`SMS: ${n.status.replaceAll('_',' ')}${n.error?` — ${n.error}`:''}`,'quiet'));
+ if(t.attempts.some(a=>['dispatching','awaiting_callback','uncertain'].includes(a.status)))section.append(el('p','A call is in flight or awaiting reconciliation. Stopping does not retract words already communicated.','quiet'));
+ if(!t.stopped)section.append(button('Stop task',()=>api('/stop'),true));},
+ request(section){const t=view.task;section.append(el('h2','Your request'),el('p',t.outcome));const details=el('details');details.append(el('summary','Request details'));details.append(el('p',`Required: ${t.hardConstraints.map(string).join('; ')||'None recorded'}`),el('p',`Preferences: ${t.preferences.map(string).join('; ')||'None recorded'}`),el('p',`Maximum total: ${money(t.budgetMax)}. ${t.discloseBudget?'May be disclosed to suppliers.':'Kept private from suppliers.'}`),el('p',`Deadline: ${date(t.deadline)} (${t.timezone})`),el('p',`Counteroffers ${t.mayCounter?'permitted':'not permitted'}. Mode: ${t.mode}.`));section.append(details);
+ if(!t.stopped){const edit=el('details');edit.append(el('summary','Edit request'));const form=el('form'),outcome=field(form,'Requested outcome',t.outcome,'textarea'),budget=field(form,'Maximum total (leave blank if unspecified)',t.budgetMax??''),deadline=field(form,'Deadline (ISO date and time)',t.deadline||''),requirements=field(form,'Hard requirements (one per line)',t.hardConstraints.map(string).join('\n'),'textarea');budget.type='number';budget.min=0;form.append(el('p','Saving creates a new revision. Offers need rechecking and prior approvals become invalid. Existing agreements are preserved.','quiet'),button('Save revised request',async()=>{await api('/revise',{changes:{outcome:outcome.value,budgetMax:budget.value===''?null:Number(budget.value),deadline:deadline.value||null,hardConstraints:requirements.value.split('\n').map(s=>s.trim()).filter(Boolean)}});}));form.addEventListener('submit',e=>e.preventDefault());edit.append(form);section.append(edit);}},
+ upload(section,props){section.append(el('h2',props.label||'Upload your artwork'),el('p','PDF, PNG or JPEG, up to 10 MB. Stored with this task; arrange delivery to the supplier separately.','quiet'));const file=field(section,'Choose file');file.type='file';file.accept='.pdf,.png,.jpg,.jpeg';section.append(button('Upload file',async()=>{const f=file.files[0];if(!f)throw new Error('Choose a file first.');const res=await fetch(`/api/tasks/${taskId}/upload`,{method:'POST',headers:{'Content-Type':f.type,'X-Filename':encodeURIComponent(f.name)},body:f});if(!res.ok)throw new Error((await res.json()).error);}));for(const u of view.uploads)section.append(el('p',`${u.filename} · ${Math.ceil(u.size/1024)} KB`));},
+ question(section){if(view.currentAction.type!=='question')return false;const q=view.currentAction.question;section.className='focus';section.append(el('h2','Needs your answer'),el('p',`${q.supplier} asks:`),el('p',q.text,'line'));const answer=field(section,'Your answer','','textarea');section.append(button('Answer question',()=>api('/answer',{questionId:q.id,answer:answer.value})));},
+ approval(section){if(view.currentAction.type!=='approval')return false;section.className='focus';section.append(el('h2','Your next decision'),el('p',view.currentAction.text));const available=view.offers.filter(o=>view.currentAction.offers.some(x=>x.id===o.id&&x.version===o.version));if(!available.length)section.append(el('p','No offer currently meets every requirement. Ask for a better offer or edit the request.'));for(const o of available){const card=el('div',undefined,'card');card.append(el('h3',`${o.supplier} · version ${o.version}`));facts(card,o);card.append(el('p',`By approving, you authorise agreement with ${o.supplier} for this scope, timing, total and listed conditions.`, 'quiet'),button('Approve these terms',()=>api('/approve',{offerId:o.id,offerVersion:o.version})));section.append(card);}},
+ offers(section){section.append(el('h2','Options'));if(!view.offers.length)section.append(el('p','Supplier offers will appear here.'));
+ for(const o of view.offers){const historical=o.validity!=='current',card=el(historical?'details':'div',undefined,'card');if(historical)card.append(el('summary',`${o.supplier} · version ${o.version} · ${o.validity}`));else card.append(el('h3',`${o.supplier} · version ${o.version}`),el('p',o.suitable?'Meets recorded requirements':'Unsuitable until resolved','tag'));facts(card,o);if(o.canCounter&&view.task.state==='Needs you')card.append(button('Ask for a better offer',()=>api('/counter',{offerId:o.id}),true));section.append(card);}},
+ arrangement(section){const a=view.task.existingArrangement;if(!a)return false;section.append(el('h2','Existing arrangement'),el('p',`Reference: ${string(a.reference)}`),el('p',`Original terms: ${string(a.acceptedTerms)}`),el('p',a.inForce?'Original arrangement remains in force. An alternative offer does not change it.':'Counterparty accepted the amendment. See the accepted terms below.'),el('p',`Amendment: ${a.amendmentStatus}`));},
+ outcome(section){section.append(el('h2','What has been agreed'));const o=view.outcome;if(!o){section.append(el('p',view.task.existingArrangement?.inForce?'Only the original arrangement remains agreed.':'No arrangement has been confirmed.'));return;}section.append(el('p',o.text));if(o.supplier)section.append(el('p',`${o.supplier} · accepted ${date(o.at)} · offer version ${o.offerVersion}`));if(o.terms)facts(section,{terms:o.terms,total:[o.terms.basePrice,o.terms.fees,o.terms.taxes].every(n=>n!==null)?o.terms.basePrice+o.terms.fees+o.terms.taxes:null,missing:[],reasons:[]});for(const p of o.prerequisites||[])section.append(el('p',string(p),'reason'));if(o.responsiblePerson)section.append(el('p',`Responsible: ${o.responsiblePerson}`));if(['Stopped','Needs reconciliation','Needs you','Working'].includes(view.task.state))section.append(el('p','This is historical acceptance evidence. Review current changes and unresolved commitments in the progress record.','reason'));},
+ timeline(section){section.append(el('h2','Progress'));const list=el('ol',undefined,'timeline');for(const e of view.events.slice().reverse()){const item=el('li');item.append(el('small',`${date(e.created_at)}${e.simulated?' · Simulated':''}`),el('p',e.text,'line'));if(e.kind==='supplier_response'||e.kind==='reconciliation'){const details=el('details');details.append(el('summary','Acceptance evidence'),el('p',JSON.stringify(e.data,null,2),'line'));item.append(details);}list.append(item);}section.append(list);for(const a of view.task.attempts){const d=el('details');d.append(el('summary',`${a.supplier} · ${a.purpose} · ${a.status}`));if(a.failure_reason)d.append(el('p',a.failure_reason));for(const line of a.notes?.transcript||[])d.append(el('p',`${line.role}: ${line.en_text}`,'line'));section.append(d);}}
+};
+function render(){
+ const page=document.createDocumentFragment();
+ // Backend layouts never become markup. Unknown block types and props are ignored.
+ for(const block of view.layout){if(!Object.hasOwn(blocks,block.type))continue;const section=el('section');if(blocks[block.type](section,block.type==='upload'?{label:block.props?.label}: {})!==false)page.append(section);}
+ $('page').replaceChildren(page);
+}
+async function poll(force=false){if(!taskId||polling)return;polling=true;
+ try{const data=await api('',undefined,'GET');authenticated=true;$('auth').replaceChildren();const fingerprint=JSON.stringify(data);view=data;if(force||(fingerprint!==last&&!['INPUT','TEXTAREA'].includes(document.activeElement?.tagName))){last=fingerprint;render();}}
+ catch(e){if(e.status===401){authenticated=false;$('page').replaceChildren();auth();}else $('message').textContent=e.message;}finally{polling=false;}}
+(async()=>{try{if(!taskId){const r=await fetch('/api/task-id');if(!r.ok)throw new Error('Open the task link sent to your phone.');taskId=(await r.json()).taskId;}await poll();setInterval(()=>poll(),2000);}catch(e){$('message').textContent=e.message;}})();
+</script></body></html>

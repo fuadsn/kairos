@@ -1,0 +1,7 @@
+{
+  "name": "kairos-prototype",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=25 <26" },
+  "scripts": { "start": "node server.js", "test": "node --test", "demo": "node server.js --seed" }
+}
