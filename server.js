@@ -117,6 +117,10 @@ export async function startServer(options = {}) {
         if (!taskId) fail('Task not found', 404);
         return respond(res, 200, { taskId });
       }
+      if (req.method === 'GET' && url.pathname === '/') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kairos</title><body style="font:18px/1.5 system-ui;max-width:32rem;margin:15vh auto;padding:0 1.25rem;background:#f4f3ef;color:#1d2420"><h1>Kairos</h1><p>Call to get something arranged. Kairos makes the calls, compares the answers, and brings you the terms to approve.</p><p><strong>${config.SARVAM_AGENT_NUMBER || 'Number coming soon'}</strong></p>`);
+      }
       const ownerRoute = url.pathname.match(/^\/api\/tasks\/([a-f0-9]{32})(?:\/(.+))?$/);
       if (ownerRoute) {
         const [, taskId, operation] = ownerRoute;
