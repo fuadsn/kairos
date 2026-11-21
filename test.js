@@ -5,14 +5,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import http from 'node:http';
 import { startServer, coerce } from './server.js';
-import { validateLayout, layoutFor } from './thinker.js';
+import { validateLayout, layoutFor, ruleAdvice, validateAdvice, research, advise, nextAction } from './thinker.js';
+
+import { openDb, suitability, callingTime, indianPhone } from './db.js';
+import { supplierVariables, flat, simulate } from './sarvam.js';
 
 const TOOL_TOKEN = 'test-only-tool-token', WEBHOOK_SECRET = 'test-only-webhook-secret';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const brief = overrides => ({ ownerPhone: '+910000000000', language: 'English', type: 'appointment', mode: 'arrangement', outcome: 'Print and deliver 100 flyers', hardConstraints: ['100 flyers'], preferences: [], deadline: '2030-12-01T12:00:00+05:30', timezone: 'Asia/Kolkata', budgetMax: 2500, discloseBudget: false, mayCounter: true, contacts: [{ name: 'Printer A', phone: '+910000000001' }, { name: 'Printer B', phone: '+910000000002' }], unresolved: [], ...overrides });
-async function harness(t, config = {}, workerInterval = 2) {
+async function harness(t, config = {}, workerInterval = 2, overrides = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'kairos-test-'));
-  const options = { port: 0, workerInterval, uploadsRoot: join(dir, 'uploads'), config: { DB_PATH: join(dir, 'test.db'), PORT: '0', PUBLIC_URL: '', TOOL_TOKEN, WEBHOOK_SECRET, SARVAM_API_KEY: '', SMS_GATEWAY_URL: '', THINKER: '', REQUIRE_OTP: '1', MAX_ATTEMPTS: '6', SIM_DELAY_MS: '0', ...config } };
+  const options = { research: async () => [], advise: async view => ruleAdvice(view), ...overrides, port: 0, workerInterval, uploadsRoot: join(dir, 'uploads'), config: { DB_PATH: join(dir, 'test.db'), PORT: '0', PUBLIC_URL: '', TOOL_TOKEN, WEBHOOK_SECRET, SARVAM_API_KEY: '', SMS_GATEWAY_URL: '', THINKER: '', REQUIRE_OTP: '1', MAX_ATTEMPTS: '6', SIM_DELAY_MS: '0', ...config } };
   const h = { app: null, dir, options };
   try { h.app = await startServer(options); } catch (error) { rmSync(dir, { recursive: true, force: true }); throw error; }
   t.after(async () => { await h.app.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -334,4 +337,281 @@ test('no answer schedules one automatic retry; owner can ask to call again after
   const cookie = await h.login(taskId);
   assert.deepEqual(await h.ok(`/api/tasks/${taskId}/retry`, {}, cookie), { retried: 1 });
   assert.ok(await dispatched(3)); assert.equal(h.app.db.task(taskId).state, 'Working');
+});
+
+const candidates = [
+  { name: 'Aroma Bakes', phone: '0484 2345678', sourceUrl: 'https://example.test/aroma', note: 'Custom cakes' },
+  { name: 'Duplicate', phone: '+91 484 234 5678', sourceUrl: 'https://example.test/duplicate', note: 'Same number' },
+  { name: 'Invalid', phone: '12345', sourceUrl: 'https://example.test/invalid', note: 'Invalid number' }
+];
+const quote = { spec: '100 flyers', availability: 'Available', deadline: brief().deadline, basePrice: 2000, fees: 0, taxes: 0, deposit: 0, upfront: 0, conditions: [], unknown: [] };
+const adviceFor = view => ({ recommendOfferId: view.offers.find(o => o.suitable && o.validity === 'current')?.id || null, counterOfferId: null, counterAsk: null, summary: 'Review the exact scope and timing before approving.' });
+
+test('discovery: optional contacts, valid unique candidates, explicit permission, sequential calls and one initial SMS', async t => {
+  const h = await harness(t, { RESEARCH_CALL_HOURS: '00:00-00:00', SIM_DELAY_MS: '600000' }, 2, { research: async () => candidates });
+  const taskId = await h.create({ contacts: undefined, supplierKind: 'custom cake bakery', location: 'Kakkanad, Kochi' }), cookie = await h.login(taskId);
+  assert.deepEqual(await h.ok('/tools/confirm-brief', { taskId }), { taskId, state: 'Needs you', research: true });
+  await h.ok('/tools/confirm-brief', { taskId });
+  const v = await h.wait(taskId, cookie, v => v.events.some(e => e.kind === 'research'));
+  assert.equal(v.contacts.length, 1); assert.equal(v.contacts[0].permitted, 0); assert.equal(v.contacts[0].phone, '••••5678');
+  assert.equal(v.task.state, 'Needs you'); assert.ok(v.layout.some(b => b.type === 'suppliers'));
+  assert.equal((await h.request(`/api/tasks/${taskId}/contacts`, { permit: [], add: [] }, cookie)).status, 409);
+  await h.ok(`/api/tasks/${taskId}/contacts`, { permit: [v.contacts[0].id], add: [{ name: 'Owner bakery', phone: '9876543210' }] }, cookie);
+  await h.wait(taskId, cookie, v => v.task.attempts.length === 1);
+  const first = h.attempt(taskId); assert.equal(h.app.db.participant(first.participant_id).name, 'Aroma Bakes');
+  await h.ok('/tools/offer', { taskId, attemptId: first.id, ...quote });
+  await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, { attempt_id: first.provider_attempt_id, status: 'connected' });
+  const both = await h.wait(taskId, cookie, v => v.task.attempts.length === 2);
+  assert.deepEqual(both.task.attempts.map(a => a.supplier), ['Aroma Bakes', 'Owner bakery']);
+  assert.ok(both.events.some(e => e.kind === 'contact_permission' && /Aroma Bakes, Owner bakery/.test(e.text)));
+  assert.equal(h.app.db.sql.prepare("SELECT count(*) n FROM notifications WHERE task_id=? AND action_key=?").get(taskId, `${taskId}:initial`).n, 1);
+});
+
+test('calling hours defer research, allow owner contacts immediately, and exempt allow-listed numbers', async t => {
+  // Pick a one-minute window twelve hours away so this does not depend on wall-clock time.
+  const local = new Date(Date.now() + 330 * 60_000), hour = (local.getUTCHours() + 12) % 24;
+  const window = `${String(hour).padStart(2,'0')}:00-${String(hour).padStart(2,'0')}:01`;
+  const h = await harness(t, { RESEARCH_CALL_HOURS: window, SIM_DELAY_MS: '600000' }, 2, { research: async () => candidates });
+  const taskId = await h.create({ contacts: [], supplierKind: 'bakery' }), cookie = await h.login(taskId);
+  await h.ok('/tools/confirm-brief', { taskId });
+  const found = await h.wait(taskId, cookie, v => v.contacts.length === 1);
+  await h.ok(`/api/tasks/${taskId}/contacts`, { permit: [found.contacts[0].id], add: [{ name: 'Owner bakery', phone: '9876543210' }] }, cookie);
+  const v = await h.wait(taskId, cookie, v => v.task.attempts.length === 1);
+  assert.equal(v.task.attempts[0].supplier, 'Owner bakery');
+  const queued = h.app.db.sql.prepare("SELECT * FROM actions WHERE task_id=? AND type='call' AND status='queued'").get(taskId);
+  assert.equal(queued.due_at, callingTime(window)); assert.ok(v.events.some(e => /outside calling hours/.test(e.text)));
+  h.app.config.ALLOW_NUMBERS = '+91 484 2345678';
+  const other = await h.create({ contacts: [], supplierKind: 'bakery' }), otherCookie = await h.login(other);
+  await h.ok('/tools/confirm-brief', { taskId: other });
+  const otherFound = await h.wait(other, otherCookie, v => v.contacts.length === 1);
+  await h.ok(`/api/tasks/${other}/contacts`, { permit: [otherFound.contacts[0].id] }, otherCookie);
+  assert.equal((await h.wait(other, otherCookie, v => v.task.attempts.length === 1)).task.attempts[0].supplier, 'Aroma Bakes');
+});
+
+test('inbound identify unblocks offers, cancels callbacks, rejects acceptance and does not consume outbound cap', async t => {
+  const h = await harness(t, { MAX_ATTEMPTS: '2', SIM_DELAY_MS: '600000' });
+  assert.deepEqual(await h.ok('/tools/identify', { phone: '9999999999' }), { role: 'customer' });
+  const taskId = await h.create({ contacts: [{ name: 'Supplier', phone: '+919876543210' }] }), cookie = await h.login(taskId);
+  await h.ok('/tools/confirm-brief', { taskId });
+  await h.wait(taskId, cookie, v => v.task.attempts.length === 1);
+  const first = h.attempt(taskId);
+  await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, { attempt_id: first.provider_attempt_id, status: 'connected' });
+  assert.equal((await h.view(taskId, cookie)).task.state, 'Blocked');
+  const inbound = await h.ok('/tools/identify', { phone: '09876543210' });
+  assert.equal(inbound.role, 'supplier'); assert.equal(inbound.taskId, taskId); assert.ok(Object.values(inbound).every(v => typeof v === 'string'));
+  await h.ok('/tools/callback', { taskId, attemptId: inbound.attemptId, minutes: '30' });
+  const offer = await h.ok('/tools/offer', { taskId, attemptId: inbound.attemptId, ...quote });
+  assert.equal((await h.view(taskId, cookie)).task.state, 'Needs you');
+  assert.equal(h.app.db.sql.prepare("SELECT count(*) n FROM actions WHERE task_id=? AND type='call' AND status='queued'").get(taskId).n, 0);
+  const rejected = await h.request('/tools/acceptance', { taskId, attemptId: inbound.attemptId, offerId: offer.offerId, offerVersion: offer.offerVersion, accepted: true });
+  assert.equal(rejected.status, 403); assert.match(rejected.data.error, /outbound confirmation/);
+  await h.ok(`/api/tasks/${taskId}/approve`, { offerId: offer.offerId, offerVersion: offer.offerVersion }, cookie);
+  const final = await h.wait(taskId, cookie, v => v.task.attempts.some(a => a.purpose === 'confirm'));
+  assert.equal(final.task.state, 'Awaiting confirmation'); assert.equal(final.task.attempts.length, 3);
+});
+
+test('implausible upfront and totals cannot be approved; owner still has correction actions', async t => {
+  const h = await harness(t), { taskId, cookie, v } = await h.ready();
+  const o = v.offers[0];
+  await h.ok('/tools/offer', { taskId, attemptId: o.attempt_id, ...o.terms, upfront: 5000 });
+  const changed = (await h.view(taskId, cookie)).offers.find(o => o.validity === 'current' && o.supplier === 'Printer A');
+  assert.equal(changed.suitable, false); assert.equal(changed.implausible, true);
+  assert.ok(changed.reasons.includes('Upfront payment ₹5000 is more than the total ₹2300; treat this quote as unreliable until the supplier corrects it.'));
+  assert.equal((await h.request(`/api/tasks/${taskId}/approve`, { offerId: changed.id, offerVersion: changed.version }, cookie)).status, 409);
+  assert.ok(changed.canCounter);
+});
+
+test('queued advice rejects foreign ids, stores valid suggestions, and never takes an owner action', async t => {
+  let foreignId = 'another-task-offer';
+  const h = await harness(t, {}, 2, { advise: async () => ({ recommendOfferId: foreignId, counterOfferId: null, counterAsk: null, summary: 'Choose this offer.' }) });
+  const other = await h.ready(); foreignId = other.v.offers[0].id;
+  const { taskId, cookie } = await h.ready();
+  const fallback = await h.wait(taskId, cookie, v => !!v.task.advice);
+  assert.equal(fallback.task.advice.source, 'rules'); assert.equal(fallback.task.advice.recommendOfferId, fallback.offers[0].id);
+  h.options.advise = async v => adviceFor(v);
+  await h.app.close(); h.app = await startServer(h.options);
+  const offer = fallback.offers[0];
+  await h.ok('/tools/offer', { taskId, attemptId: offer.attempt_id, ...offer.terms, basePrice: 2250 });
+  const advised = await h.wait(taskId, cookie, v => v.task.advice?.source === 'codex');
+  assert.equal(advised.task.advice.summary, adviceFor(advised).summary);
+  assert.equal(advised.task.state, 'Needs you'); assert.equal(advised.task.attempts.length, fallback.task.attempts.length);
+  assert.equal(h.app.db.sql.prepare('SELECT count(*) n FROM approvals WHERE task_id=?').get(taskId).n, 0);
+});
+
+test('budget disclosure is opt-in for flat drafts, supplier variables and inbound identify', async t => {
+  const h = await harness(t, { SIM_DELAY_MS: '600000' });
+  for (const discloseBudget of [undefined, 'false', 'yes']) {
+    const taskId = await h.create({ discloseBudget, contacts: [{ name: 'Supplier', phone: '+919876543210' }] }), cookie = await h.login(taskId);
+    await h.ok('/tools/confirm-brief', { taskId });
+    await h.wait(taskId, cookie, v => v.task.attempts.length === 1);
+    assert.equal(h.app.db.task(taskId).discloseBudget, false);
+    assert.equal(Object.hasOwn(JSON.parse(h.attempt(taskId).variables), 'budgetMax'), false);
+    const inbound = await h.ok('/tools/identify', { phone: '9876543210' });
+    assert.equal(inbound.taskId, taskId); assert.equal(Object.hasOwn(inbound, 'budget_max'), false);
+    assert.ok(!JSON.stringify(inbound).includes('2500'));
+  }
+});
+
+// Database tests use a disposable on-disk database and no sockets. They also run in restricted sandboxes.
+function storeHarness(t, config = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'kairos-store-test-')), path = join(dir, 'test.db');
+  const settings = { MAX_ATTEMPTS: '6', SIM_DELAY_MS: '0', RESEARCH_CALL_HOURS: '00:00-00:00', ...config };
+  const db = openDb(path, settings);
+  t.after(() => { db.close(); rmSync(dir, { recursive: true, force: true }); });
+  const create = input => db.createDraft(brief(input)).taskId;
+  const drain = (researchFake = () => [], adviseFake = ruleAdvice) => {
+    for (let i = 0; i < 100; i++) {
+      const action = db.claim(); if (!action) return;
+      if (action.type === 'research') db.researchResult(action, researchFake(db.task(action.task_id)));
+      else if (action.type === 'think') db.adviceResult(action, adviseFake(db.view(action.task_id)));
+      else if (action.type === 'call') { const call = db.prepareCall(action); if (call) db.dispatched(call.attemptId, { attemptId: `sim-${call.attemptId}`, simulated: true }); }
+      else if (action.type === 'simulate') { simulate(db, action.payload.attemptId); db.finishAction(action.id); }
+      else db.finishAction(action.id);
+    }
+    assert.fail('Worker did not settle');
+  };
+  return { db, create, drain, settings };
+}
+
+test('store: original question, counter, approval and confirmation workflow remains sequential', t => {
+  const { db, create, drain } = storeHarness(t), taskId = create(); db.confirmBrief(taskId); drain();
+  let v = db.view(taskId); assert.equal(v.currentAction.type, 'question');
+  db.answer(taskId, { questionId: v.questions[0].id, answer: 'A5' }); drain();
+  v = db.view(taskId); assert.equal(v.task.state, 'Needs you'); assert.equal(v.offers.length, 2); assert.equal(v.task.advice.source, 'rules');
+  const second = v.offers[1]; db.counter(taskId, { offerId: second.id }); drain();
+  v = db.view(taskId); const chosen = v.offers.find(o => o.id === second.id && o.validity === 'current');
+  assert.equal(chosen.total, 2200); db.approve(taskId, { offerId: chosen.id, offerVersion: chosen.version }, brief().ownerPhone); drain();
+  assert.equal(db.task(taskId).state, 'Confirmed'); assert.equal(db.view(taskId).task.attempts.length, 5);
+});
+
+test('store: discovery dedupes, masks numbers, persists permission and schedules both suppliers', t => {
+  const { db, create, drain } = storeHarness(t, { SIM_DELAY_MS: '600000' });
+  const taskId = create({ contacts: undefined, supplierKind: 'bakery', location: 'Kochi' });
+  assert.equal(db.task(taskId).supplierKind, 'bakery'); assert.equal(db.confirmBrief(taskId).research, true);
+  drain(() => candidates); const v = db.view(taskId);
+  assert.equal(v.contacts.length, 1); assert.equal(v.contacts[0].permitted, 0); assert.equal(db.task(taskId).state, 'Needs you');
+  assert.throws(() => db.contacts(taskId, { permit: [], add: [] }), /Choose or add/);
+  db.contacts(taskId, { permit: [v.contacts[0].id], add: [{ name: 'Owner bakery', phone: '9876543210' }] }); drain();
+  const a = db.sql.prepare('SELECT * FROM call_attempts WHERE task_id=?').get(taskId);
+  db.offer({ taskId, attemptId: a.id, ...quote }); db.sarvamWebhook({ attempt_id: a.provider_attempt_id, status: 'connected' }); drain();
+  assert.deepEqual(db.view(taskId).task.attempts.map(a => a.supplier), ['Aroma Bakes', 'Owner bakery']);
+  assert.equal(db.sql.prepare("SELECT count(*) n FROM notifications WHERE action_key=?").get(`${taskId}:initial`).n, 1);
+  assert.equal(db.participant(v.contacts[0].id).phone, '+914842345678');
+});
+
+test('store: calling windows and allow-list preserve immediate owner calls and serialized dispatch', t => {
+  assert.equal(callingTime('09:00-20:00', Date.parse('2030-01-01T08:00:00+05:30')), Date.parse('2030-01-01T09:00:00+05:30'));
+  assert.equal(callingTime('09:00-20:00', Date.parse('2030-01-01T20:00:00+05:30')), Date.parse('2030-01-02T09:00:00+05:30'));
+  assert.equal(callingTime('22:00-06:00', Date.parse('2030-01-01T23:00:00+05:30')), Date.parse('2030-01-01T23:00:00+05:30'));
+  const hour = (new Date(Date.now() + 330 * 60_000).getUTCHours() + 12) % 24, window = `${String(hour).padStart(2,'0')}:00-${String(hour).padStart(2,'0')}:01`;
+  const { db, create, drain, settings } = storeHarness(t, { SIM_DELAY_MS: '600000', RESEARCH_CALL_HOURS: window });
+  const taskId = create({ contacts: [], supplierKind: 'bakery' }); db.confirmBrief(taskId); drain(() => candidates);
+  const p = db.view(taskId).contacts[0]; db.contacts(taskId, { permit: [p.id], add: [{ name: 'Owner', phone: '9876543210' }] }); drain();
+  assert.deepEqual(db.view(taskId).task.attempts.map(a => a.supplier), ['Owner']);
+  const q = db.sql.prepare("SELECT * FROM actions WHERE task_id=? AND type='call' AND status='queued'").get(taskId);
+  assert.equal(q.due_at, callingTime(window));
+  settings.ALLOW_NUMBERS = '0484 2345678'; db.sql.prepare('UPDATE actions SET due_at=0 WHERE id=?').run(q.id);
+  drain(); assert.equal(db.view(taskId).task.attempts.length, 1, 'a pending call cannot overlap the owner call');
+  const another = create({ contacts: [], supplierKind: 'bakery' }); db.confirmBrief(another); drain(() => candidates);
+  db.contacts(another, { permit: [db.view(another).contacts[0].id] }); drain(); assert.equal(db.view(another).task.attempts.length, 1);
+});
+
+test('store: inbound offer unblocks and preserves outbound cap; callback is cancelled', t => {
+  const { db, create, drain } = storeHarness(t, { MAX_ATTEMPTS: '2', SIM_DELAY_MS: '600000' });
+  const taskId = create({ contacts: [{ name: 'Supplier', phone: '+919876543210' }] }); db.confirmBrief(taskId); drain();
+  const a = db.sql.prepare('SELECT * FROM call_attempts WHERE task_id=?').get(taskId);
+  db.sarvamWebhook({ attempt_id: a.provider_attempt_id, status: 'connected' }); assert.equal(db.task(taskId).state, 'Blocked');
+  const inbound = db.identify({ phone: '09876543210' }); assert.equal(inbound.role, 'supplier');
+  assert.equal(db.attempt(inbound.attemptId).provider, 'sarvam-inbound');
+  db.callback({ taskId, attemptId: inbound.attemptId, minutes: 30 });
+  const o = db.offer({ taskId, attemptId: inbound.attemptId, ...quote }); assert.equal(db.task(taskId).state, 'Needs you');
+  assert.equal(db.sql.prepare("SELECT count(*) n FROM actions WHERE task_id=? AND type='call' AND status='queued'").get(taskId).n, 0);
+  assert.throws(() => db.acceptance({ taskId, attemptId: inbound.attemptId, offerId: o.offerId, offerVersion: o.offerVersion, accepted: true }), /outbound confirmation/);
+  assert.equal(db.task(taskId).state, 'Needs you');
+  db.approve(taskId, { offerId: o.offerId, offerVersion: o.offerVersion }, brief().ownerPhone); drain();
+  assert.equal(db.view(taskId).task.attempts.length, 3); assert.equal(db.task(taskId).state, 'Awaiting confirmation');
+  assert.deepEqual(db.identify({ phone: '9876543210' }), { role: 'customer' });
+});
+
+test('store: implausible payments, extreme totals and all-implausible review', () => {
+  for (const payment of ['upfront','deposit']) {
+    const fit = suitability(brief(), { ...quote, [payment]: 5000 }); assert.equal(fit.suitable, false); assert.equal(fit.implausible, true);
+    assert.ok(fit.reasons.includes('Upfront payment ₹5000 is more than the total ₹2000; treat this quote as unreliable until the supplier corrects it.'));
+  }
+  const fit = suitability(brief(), { ...quote, basePrice: 13000 }); assert.ok(fit.reasons.includes('Total ₹13000 is far above the ₹2500 budget.'));
+  assert.equal(nextAction({ task: brief(), questions: [], offers: [{ ...fit, validity: 'current' }], participants: [], attempts: [] }).type, 'review_quotes');
+  assert.equal(indianPhone('+1 212 555 1234'), null); assert.equal(indianPhone('0484-2345678'), '+914842345678'); assert.equal(indianPhone('011 23456789'), '+911123456789');
+});
+
+test('store: advice validation, stale result suppression, rule fallback and private counter variables', async t => {
+  const { db, create, drain } = storeHarness(t), taskId = create(); db.confirmBrief(taskId); drain();
+  db.answer(taskId, { questionId: db.view(taskId).questions[0].id, answer: 'A5' });
+  drain(() => [], () => ({ recommendOfferId: 'foreign', counterOfferId: null, counterAsk: null, summary: 'Wrong task' }));
+  assert.equal(db.task(taskId).advice.source, 'rules'); assert.equal(db.task(taskId).state, 'Needs you');
+  const prior = db.view(taskId).offers[0]; db.offer({ taskId, attemptId: prior.attempt_id, ...prior.terms, basePrice: 2250 }); drain(() => [], adviceFor);
+  assert.equal(db.task(taskId).advice.source, 'codex'); assert.equal(db.task(taskId).state, 'Needs you');
+  assert.equal(db.sql.prepare('SELECT count(*) n FROM approvals WHERE task_id=?').get(taskId).n, 0);
+  const completed = db.sql.prepare("SELECT * FROM actions WHERE task_id=? AND kind='think' ORDER BY id DESC LIMIT 1").get(taskId);
+  db.revise(taskId, { outcome: 'Print 200 flyers' });
+  db.adviceResult({ ...completed, payload: JSON.parse(completed.payload) }, adviceFor(db.view(taskId)));
+  assert.equal(db.task(taskId).advice, null);
+  const privateAdvice = validateAdvice({ recommendOfferId: null, counterOfferId: 'offer', counterAsk: 'Include fees within ₹2500.', summary: 'Ask for fees to be included.' }, { task: { ...brief(), revision: 1 }, offers: [{ id: 'offer', task_revision: 1, validity: 'current', canCounter: true }] });
+  const variables = supplierVariables({ ...brief(), id: taskId }, {}, 'counter', { counterAsk: privateAdvice.counterAsk });
+  assert.equal(variables.counter_ask, privateAdvice.counterAsk);
+  assert.ok(!JSON.stringify(variables).includes('2500')); assert.equal(flat(variables).budget_max, ''); assert.ok(flat(variables).counter_ask);
+  assert.deepEqual(await research(brief(), {}), []); assert.equal((await advise(db.view(taskId), {})).source, 'rules');
+  for (const value of [undefined, 'false', 'yes', false]) assert.equal(coerce({ discloseBudget: value }).discloseBudget, false);
+  assert.equal(coerce({ discloseBudget: 'true' }).discloseBudget, true);
+});
+
+test('store: empty research, revision recovery, stopped results and privacy defaults', t => {
+  const { db, create, drain } = storeHarness(t);
+  const taskId = create({ contacts: [], supplierKind: 'bakery', discloseBudget: undefined });
+  db.confirmBrief(taskId); drain();
+  assert.equal(db.task(taskId).state, 'Needs you'); assert.equal(db.task(taskId).discloseBudget, false);
+  assert.ok(db.view(taskId).events.some(e => e.text === 'Kairos could not find suppliers automatically. Add a name and number to continue.'));
+  db.revise(taskId, { location: 'Kochi' });
+  let researchAction = db.claim(); assert.equal(researchAction.type, 'research');
+  db.recover(); researchAction = db.claim(); assert.equal(researchAction.type, 'research');
+  assert.equal(db.task(taskId).state, 'Needs you');
+  db.stop(taskId); db.researchResult(researchAction, candidates); assert.equal(db.view(taskId).contacts.length, 0);
+  const other = create({ contacts: [{ name: 'Supplier', phone: '+919876543210' }], discloseBudget: undefined });
+  db.confirmBrief(other); const identified = db.identify({ phone: '9876543210' });
+  assert.equal(Object.hasOwn(identified, 'budget_max'), false); assert.ok(!JSON.stringify(identified).includes('2500'));
+  db.sql.prepare('UPDATE tasks SET created_at=? WHERE id=?').run('2020-01-01T00:00:00.000Z', other);
+  assert.deepEqual(db.identify({ phone: '9876543210' }), { role: 'customer' });
+  db.purgeExpired(24); assert.equal(db.sql.prepare('SELECT count(*) n FROM actions WHERE task_id=?').get(other).n, 0);
+});
+
+test('store: owner-started counter passes stored advice only to the counter call', t => {
+  const { db, create, drain } = storeHarness(t, { SIM_DELAY_MS: '600000' });
+  const taskId = create({ contacts: [{ name: 'Supplier', phone: '+919876543210' }], discloseBudget: true });
+  db.confirmBrief(taskId); drain();
+  const a = db.sql.prepare('SELECT * FROM call_attempts WHERE task_id=?').get(taskId);
+  const offer = db.offer({ taskId, attemptId: a.id, ...quote, basePrice: 3000 });
+  db.sarvamWebhook({ attempt_id: a.provider_attempt_id, status: 'connected' });
+  drain(() => [], () => ({ recommendOfferId: null, counterOfferId: offer.offerId, counterAsk: 'Please include fees within ₹2500.', summary: 'Ask for an all-inclusive price.' }));
+  assert.equal(db.view(taskId).task.attempts.length, 1); assert.equal(db.task(taskId).state, 'Needs you');
+  db.counter(taskId, { offerId: offer.offerId }); const action = db.claim(), call = db.prepareCall(action);
+  const variables = supplierVariables(call.task, call.participant, call.purpose, call);
+  assert.equal(variables.counter_ask, db.task(taskId).advice.counterAsk); assert.equal(flat(variables).counter_ask, variables.counter_ask);
+  assert.equal(Object.hasOwn(supplierVariables(call.task, call.participant, 'collect_offer', call), 'counter_ask'), false);
+  assert.equal(db.identify({ phone: '9876543210' }).role, 'customer');
+});
+
+test('returning customer hears a state-level status; a 24-hour business found by research is called at once', async t => {
+  const research = async () => [{ name: 'Night Bakes', phone: '+91 98470 11111', sourceUrl: 'https://example.com/n', note: 'Cakes · Hours: Open 24 hours' }, { name: 'Day Bakes', phone: '+91 98470 22222', sourceUrl: 'https://example.com/d', note: 'Cakes' }];
+  const h = await harness(t, { RESEARCH_CALL_HOURS: '00:00-00:01', SIM_DELAY_MS: '600000' });
+  await h.app.close(); h.app = await startServer({ ...h.options, research });
+  assert.deepEqual(await h.ok('/tools/identify', { phone: '+919999900000' }), { role: 'customer' });
+  const { taskId } = await h.ok('/tools/draft', brief({ ownerPhone: '+919999900000', contacts: [], supplierKind: 'bakery', location: 'Kochi' }));
+  await h.ok('/tools/confirm-brief', { taskId });
+  let v; for (let i = 0; i < 300 && !((v = h.app.db.view(taskId)).contacts?.length >= 2); i++) await sleep(10);
+  const who = await h.ok('/tools/identify', { phone: '09999900000' });
+  assert.equal(who.role, 'owner'); assert.equal(who.ownerTaskId, taskId); assert.match(who.status_summary, /found 2 possible suppliers/);
+  assert.ok(!/₹|\d{4,}/.test(who.status_summary), 'no prices or numbers in a caller-ID status');
+  const cookie = await h.login(taskId);
+  await h.ok(`/api/tasks/${taskId}/contacts`, { permit: v.contacts.map(c => c.id) }, cookie);
+  let first; for (let i = 0; i < 300 && !(first = h.app.db.sql.prepare('SELECT p.name FROM call_attempts a JOIN participants p ON p.id=a.participant_id WHERE a.task_id=?').get(taskId)); i++) await sleep(10);
+  assert.equal(first?.name, 'Night Bakes');
 });

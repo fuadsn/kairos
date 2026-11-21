@@ -6,7 +6,7 @@ import { randomBytes } from 'node:crypto';
 import { openDb, secretEqual } from './db.js';
 import { send, status as smsStatus } from './sms.js';
 import { placeCall, supplierVariables, simulate } from './sarvam.js';
-import { layoutFor } from './thinker.js';
+import { layoutFor, research, advise, ruleAdvice } from './thinker.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
 // Intentionally small: KEY=value, optional matching quotes, full-line comments.
@@ -25,7 +25,9 @@ export function coerce(input) {
   const out = { ...input }, blank = v => v == null || /^(|unknown|null|none|not stated)$/i.test(String(v).trim());
   for (const k of ['hardConstraints', 'preferences', 'unresolved', 'unknown', 'conditions']) if (typeof out[k] === 'string') out[k] = out[k].split(/[;\n]/).map(x => x.trim()).filter(x => x && !blank(x));
   for (const k of ['budgetMax', 'basePrice', 'fees', 'taxes', 'deposit', 'upfront', 'offerVersion', 'minutes']) if (k in out && typeof out[k] !== 'number') out[k] = blank(out[k]) || !/\d/.test(out[k]) ? null : Number(String(out[k]).replace(/[^\d.]/g, ''));
-  for (const k of ['discloseBudget', 'mayCounter', 'accepted']) if (typeof out[k] === 'string') out[k] = /^(true|yes|1)$/i.test(out[k].trim());
+  for (const k of ['mayCounter', 'accepted']) if (typeof out[k] === 'string') out[k] = /^(true|yes|1)$/i.test(out[k].trim());
+  if ('discloseBudget' in out) out.discloseBudget = out.discloseBudget === true || out.discloseBudget === 'true';
+  for (const k of ['supplierKind', 'location', 'phone']) if (typeof out[k] === 'string') out[k] = out[k].trim();
   if (typeof out.contacts === 'string') out.contacts = out.contacts.split(/[;\n]/).map(c => { const phone = c.match(/\+?\d[\d\s-]{8,}\d/)?.[0]; return phone && { name: c.replace(phone, '').replace(/[,:|-]+\s*$/, '').trim() || 'Supplier', phone: phone.replace(/[\s-]/g, '').replace(/^(?:0|91)?(\d{10})$/, '+91$1') }; }).filter(Boolean);
   if (!out.existingArrangement && out.existingReference) out.existingArrangement = { reference: out.existingReference, acceptedTerms: out.existingTerms };
   if (typeof out.ownerPhone === 'string') out.ownerPhone = out.ownerPhone.replace(/[\s-]/g, '').replace(/^(?:0|91)?(\d{10})$/, '+91$1');
@@ -73,6 +75,15 @@ export async function startServer(options = {}) {
           try { db.dispatched(prepared.attemptId, await placeCall({ ...prepared, variables, actionKey: action.action_key, actionId: action.id }, config)); }
           catch (error) { db.dispatchFailed(prepared.attemptId, error); }
         }
+      } else if (action.type === 'research') {
+        let result = [];
+        try { result = await (options.research || research)(db.task(action.task_id), config); } catch { /* let the owner add contacts */ }
+        db.researchResult(action, result);
+      } else if (action.type === 'think') {
+        const view = db.view(action.task_id);
+        let result;
+        try { result = await (options.advise || advise)(view, config); } catch { result = ruleAdvice(view); }
+        db.adviceResult(action, result);
       } else if (action.type === 'simulate') {
         simulate(db, action.payload.attemptId);
         db.finishAction(action.id);
@@ -160,6 +171,7 @@ export async function startServer(options = {}) {
           return respond(res, 201, { ok: true });
         }
         const input = await readJson(req);
+        if (operation === 'contacts') return respond(res, 200, db.contacts(taskId, input));
         if (operation === 'answer') return respond(res, 200, db.answer(taskId, input));
         if (operation === 'revise') return respond(res, 200, db.revise(taskId, input.changes));
         if (operation === 'counter') return respond(res, 200, db.counter(taskId, input));
@@ -177,10 +189,11 @@ export async function startServer(options = {}) {
         res.on('finish', () => { if (res.statusCode >= 400) console.error(`[tool rejected] ${url.pathname} ${res.statusCode} keys=${Object.keys(input).join(',')}`); });
         if (url.pathname === '/tools/draft') {
           const result = db.createDraft(input);
-          db.setLayout(result.taskId, await layoutFor(db.task(result.taskId), config.THINKER));
+          db.setLayout(result.taskId, await layoutFor({ ...db.task(result.taskId), contacts: input.contacts || [] }));
           return respond(res, 201, result);
         }
         if (url.pathname === '/tools/confirm-brief') return respond(res, 200, db.confirmBrief(input.taskId));
+        if (url.pathname === '/tools/identify') return respond(res, 200, db.identify(input));
         if (url.pathname === '/tools/callback') return respond(res, 200, db.callback(input));
         if (url.pathname === '/tools/question') return respond(res, 200, db.question(input));
         if (url.pathname === '/tools/offer') return respond(res, 200, db.offer(input));
@@ -212,7 +225,7 @@ export async function startServer(options = {}) {
   timer = setInterval(tick, options.workerInterval ?? 100);
   return { server, db, config, url, tick,
     async close() {
-      closing = true; clearInterval(timer);
+      closing = true; clearInterval(timer); clearInterval(purgeTimer);
       await new Promise(resolve => { server.close(resolve); server.closeIdleConnections(); });
       while (busy) await new Promise(resolve => setTimeout(resolve, 10));
       db.close();

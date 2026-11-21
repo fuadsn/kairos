@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes, randomInt, createHash, timingSafeEqual } from 'node:crypto';
-import { nextAction } from './thinker.js';
+import { nextAction, validateAdvice } from './thinker.js';
 
 const id = () => randomBytes(16).toString('hex');
 const now = () => new Date().toISOString();
@@ -18,6 +18,25 @@ function list(value, field) { check(Array.isArray(value) && value.length <= 30, 
 const phone = value => { check(typeof value === 'string' && /^\+[1-9]\d{7,14}$/.test(value), 'Use an international phone number', 400); return value; };
 const activeAttempt = "('dispatching','awaiting_callback','uncertain')";
 
+// Indian mobile numbers and STD landlines, with optional country/trunk prefix.
+export function indianPhone(value) {
+  if (typeof value !== 'string' || !/^\+?[\d\s().-]+$/.test(value.trim())) return null;
+  let digits = value.replace(/\D/g, '');
+  if (digits.length === 12 && digits.startsWith('91')) digits = digits.slice(2);
+  else if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
+  return /^[1-9]\d{9}$/.test(digits) ? `+91${digits}` : null;
+}
+const lastTen = value => String(value || '').replace(/\D/g, '').slice(-10);
+// India has no daylight-saving transitions. Windows may also cross midnight.
+export function callingTime(value, time = Date.now()) {
+  const match = /^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/.exec(value || '09:00-20:00');
+  check(match && +match[1] < 24 && +match[3] < 24 && +match[2] < 60 && +match[4] < 60, 'Invalid RESEARCH_CALL_HOURS', 400);
+  const start = +match[1] * 60 + +match[2], end = +match[3] * 60 + +match[4];
+  const local = new Date(time + 330 * 60_000), minute = local.getUTCHours() * 60 + local.getUTCMinutes();
+  if (start === end || (start < end ? minute >= start && minute < end : minute >= start || minute < end)) return time;
+  const midnight = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate()) - 330 * 60_000;
+  return midnight + start * 60_000 + (minute >= start ? 86400_000 : 0);
+}
 export function suitability(task, terms, validity = 'current') {
   const reasons = [];
   const missing = [...terms.unknown];
@@ -26,6 +45,16 @@ export function suitability(task, terms, validity = 'current') {
   if (validity !== 'current') reasons.push(validity === 'recheck' ? 'Request changed; this offer needs rechecking.' : 'Replaced by a newer offer version.');
   if (total === null) reasons.push('Unknown charges: cannot confirm within budget.');
   if (total !== null && task.budgetMax !== null && total > task.budgetMax) reasons.push(`Total ₹${total} exceeds the ₹${task.budgetMax} budget, including fees and taxes.`);
+  let implausible = false;
+  const knownTotal = terms.basePrice !== null ? terms.basePrice + (terms.fees ?? 0) + (terms.taxes ?? 0) : null;
+  const payment = Math.max(terms.upfront ?? 0, terms.deposit ?? 0);
+  if (knownTotal !== null && payment > knownTotal) {
+    implausible = true;
+    reasons.push(`Upfront payment ₹${payment} is more than the total ₹${knownTotal}; treat this quote as unreliable until the supplier corrects it.`);
+  }
+  if (total !== null && task.budgetMax !== null && total > 5 * task.budgetMax) {
+    implausible = true; reasons.push(`Total ₹${total} is far above the ₹${task.budgetMax} budget.`);
+  }
   if (task.deadline) {
     if (!terms.deadline || !Number.isFinite(Date.parse(terms.deadline))) reasons.push('Delivery or appointment deadline is unconfirmed.');
     else if (Date.parse(terms.deadline) > Date.parse(task.deadline)) reasons.push('The offered deadline misses your required deadline.');
@@ -43,7 +72,7 @@ export function suitability(task, terms, validity = 'current') {
   }
   if (terms.deposit === null || terms.upfront === null) reasons.push('Deposit or upfront payment is unknown.');
   if (terms.unknown.length) reasons.push(`Missing details: ${terms.unknown.join(', ')}`);
-  return { total, missing: [...new Set(missing)], suitable: reasons.length === 0, reasons };
+  return { total, implausible, missing: [...new Set(missing)], suitable: reasons.length === 0, reasons };
 }
 
 export function openDb(path, config = {}) {
@@ -145,6 +174,11 @@ export function openDb(path, config = {}) {
       token_hash TEXT PRIMARY KEY, owner_phone TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at TEXT NOT NULL
     );`);
   for (const col of ['callback_at INTEGER', 'callback_done INTEGER NOT NULL DEFAULT 0']) { try { sql.exec(`ALTER TABLE call_attempts ADD COLUMN ${col}`); } catch { /* already present */ } }
+  // Keep the original CHECK constraint and all live foreign keys intact.
+  // New action kinds use the legacy simulate envelope, decoded by claim().
+  for (const [table, columns] of Object.entries({ tasks: ['advice TEXT'], participants: ["source TEXT NOT NULL DEFAULT 'owner' CHECK(source IN ('owner','research'))", 'source_url TEXT', 'note TEXT'], actions: ['kind TEXT'] })) {
+    for (const col of columns) { try { sql.exec(`ALTER TABLE ${table} ADD COLUMN ${col}`); } catch { /* already present */ } }
+  }
   const get = (q, ...args) => sql.prepare(q).get(...args);
   const all = (q, ...args) => sql.prepare(q).all(...args);
   const run = (q, ...args) => sql.prepare(q).run(...args);
@@ -158,7 +192,7 @@ export function openDb(path, config = {}) {
   function task(taskId) {
     const row = get('SELECT * FROM tasks WHERE id=?', taskId);
     check(row, 'Task not found', 404);
-    return { ...parse(row.brief), ...row, existingArrangement: parse(row.arrangement), outcomeRecord: parse(row.outcome_record), layout: parse(row.layout), simulated: !!row.simulated, stopped: !!row.stopped };
+    return { ...parse(row.brief), ...row, existingArrangement: parse(row.arrangement), outcomeRecord: parse(row.outcome_record), layout: parse(row.layout), advice: parse(row.advice), simulated: !!row.simulated, stopped: !!row.stopped };
   }
   function event(taskId, kind, message, data = {}) {
     const t = task(taskId);
@@ -169,7 +203,7 @@ export function openDb(path, config = {}) {
   function state(taskId, value, reason = null) { run('UPDATE tasks SET state=?,blocked_reason=?,updated_at=? WHERE id=?', value, reason, now(), taskId); }
   function enqueue(taskId, type, key, payload, due = 0) {
     const t = task(taskId);
-    run('INSERT OR IGNORE INTO actions(task_id,task_revision,type,action_key,payload,due_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)', taskId, t.revision, type, key, json(payload), due, now(), now());
+    run('INSERT OR IGNORE INTO actions(task_id,task_revision,type,kind,action_key,payload,due_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)', taskId, t.revision, ['research','think','inbound'].includes(type) ? 'simulate' : type, type, key, json(payload), due, now(), now());
   }
   function link(t) { return `${(config.PUBLIC_URL || 'http://localhost:3000').replace(/\/$/, '')}/t/${t.id}`; }
   function notify(taskId, key, message, kind = 'update') {
@@ -187,7 +221,7 @@ export function openDb(path, config = {}) {
     check(a.task_id === t.id, 'Attempt belongs to another task', 403);
     const p = get('SELECT * FROM participants WHERE id=? AND task_id=?', a.participant_id, t.id);
     check(p, 'Unknown supplier', 403);
-    if (!allowStale) { allowed(t); check(p.permitted && a.task_revision === t.revision, 'Stale call or revoked contact permission'); }
+    if (!allowStale) { allowed(t); check((p.permitted || a.provider === 'sarvam-inbound') && a.task_revision === t.revision, 'Stale call or revoked contact permission'); }
     return { a, t, p };
   }
   function offerRow(offerId, version) {
@@ -196,18 +230,20 @@ export function openDb(path, config = {}) {
   }
   function queueCall(taskId, participantId, purpose, payload = {}) {
     const t = task(taskId); allowed(t);
-    check(!get(`SELECT 1 FROM call_attempts WHERE task_id=? AND status IN ${activeAttempt}`, taskId), 'A call is still in flight or uncertain');
-    check(!get("SELECT 1 FROM actions WHERE task_id=? AND type='call' AND status IN ('queued','in_flight')", taskId), 'A call is already queued');
+    check(!get(`SELECT 1 FROM call_attempts WHERE task_id=? AND provider<>'sarvam-inbound' AND status IN ${activeAttempt}`, taskId), 'A call is still in flight or uncertain');
+    check(!get("SELECT 1 FROM actions WHERE task_id=? AND type='call' AND (status='in_flight' OR (status='queued' AND due_at<=?))", taskId, Date.now()), 'A call is already queued');
     const p = get('SELECT * FROM participants WHERE id=? AND task_id=? AND permitted=1', participantId, taskId);
     check(p, 'Contact is not permitted', 403);
-    if (get('SELECT count(*) AS n FROM call_attempts WHERE task_id=?', taskId).n >= maxAttempts) { block(taskId, `The ${maxAttempts}-call limit is exhausted. Start a new task with confirmed details and reachable contacts to continue.`); return; }
+    if (get('SELECT count(*) AS n FROM call_attempts WHERE task_id=? AND provider<>\'sarvam-inbound\'', taskId).n >= maxAttempts) { block(taskId, `The ${maxAttempts}-call limit is exhausted. Start a new task with confirmed details and reachable contacts to continue.`); return; }
     if (purpose === 'counter') {
       check(t.mayCounter, 'Counteroffers are not authorised');
       check(!get("SELECT 1 FROM call_attempts WHERE task_id=? AND participant_id=? AND purpose='counter'", taskId, participantId), 'Only one counteroffer round is permitted per supplier');
     }
     if (purpose === 'confirm') check(db.authority(taskId, payload.offerId, payload.offerVersion).ok, 'Approval is no longer valid');
     const key = `${taskId}:r${t.revision}:${purpose}:${participantId}:${payload.questionId || payload.offerVersion || (payload.callbackOf ? `cb${payload.callbackOf}` : 'initial')}`;
-    enqueue(taskId, 'call', key, { participantId, purpose, ...payload }, payload.dueAt || 0);
+    const requested = Math.max(Date.now(), payload.dueAt || 0), due = gatedTime(p, requested);
+    enqueue(taskId, 'call', key, { participantId, purpose, ...payload }, due);
+    if (due > requested) gateEvent(taskId, p, due);
     state(taskId, purpose === 'confirm' ? 'Awaiting confirmation' : 'Working');
     if (payload.questionId) run('UPDATE questions SET resumed=1 WHERE id=?', payload.questionId);
     event(taskId, 'call_queued', `${purpose === 'confirm' ? 'Seeking exact-term confirmation from' : purpose === 'counter' ? 'Asking for a better offer from' : 'Preparing to call'} ${p.name}.`, { participantId, purpose });
@@ -215,12 +251,22 @@ export function openDb(path, config = {}) {
   function plan(taskId) {
     const t = task(taskId);
     if (t.stopped || ['Draft','Awaiting confirmation','Awaiting required action','Confirmed','Completed','Needs reconciliation','Blocked'].includes(t.state)) return;
-    if (get(`SELECT 1 FROM call_attempts WHERE task_id=? AND status IN ${activeAttempt}`, taskId) || get("SELECT 1 FROM actions WHERE task_id=? AND type='call' AND status IN ('queued','in_flight')", taskId)) return;
-    const cb = get('SELECT * FROM call_attempts WHERE task_id=? AND task_revision=? AND callback_at IS NOT NULL AND callback_done=0 ORDER BY created_at LIMIT 1', taskId, t.revision);
-    if (cb) { run('UPDATE call_attempts SET callback_done=1 WHERE id=?', cb.id); queueCall(taskId, cb.participant_id, 'collect_offer', { callbackOf: cb.id, dueAt: cb.callback_at }); return; }
+    if (get(`SELECT 1 FROM call_attempts WHERE task_id=? AND provider<>'sarvam-inbound' AND status IN ${activeAttempt}`, taskId) || get("SELECT 1 FROM actions WHERE task_id=? AND type='call' AND (status='in_flight' OR (status='queued' AND due_at<=?))", taskId, Date.now())) return;
+    const permitted = all('SELECT * FROM participants WHERE task_id=? AND permitted=1 ORDER BY ordinal', taskId);
+    if (!permitted.length) {
+      state(taskId, 'Needs you');
+      if (t.supplierKind) enqueue(taskId, 'research', `${taskId}:r${t.revision}:research`, {});
+      return;
+    }
+    const cb = get('SELECT * FROM call_attempts WHERE task_id=? AND task_revision=? AND callback_at IS NOT NULL AND callback_done=0 AND participant_id IN (SELECT id FROM participants WHERE permitted=1) ORDER BY created_at LIMIT 1', taskId, t.revision);
+    if (cb) { run('UPDATE call_attempts SET callback_done=1 WHERE id=?', cb.id); queueCall(taskId, cb.participant_id, 'collect_offer', { callbackOf: cb.id, dueAt: cb.callback_at }); plan(taskId); return; }
     const v = db.view(taskId);
-    const action = nextAction({ ...v, offers: v.offers.filter(o => o.task_revision === t.revision), questions: v.questions.filter(q => q.task_revision === t.revision), participants: all('SELECT * FROM participants WHERE task_id=? AND permitted=1 ORDER BY ordinal', taskId), attempts: all('SELECT * FROM call_attempts WHERE task_id=? AND task_revision=?', taskId, t.revision) });
-    if (action.type === 'call_supplier') queueCall(taskId, action.participantId, action.purpose, { ...(action.questionId ? { questionId: action.questionId } : {}) });
+    const action = nextAction({ ...v, offers: v.offers.filter(o => o.task_revision === t.revision), questions: v.questions.filter(q => q.task_revision === t.revision && (q.answer === null || permitted.some(p => p.id === q.participant_id))), participants: permitted.filter(p => !get("SELECT 1 FROM actions WHERE task_id=? AND type='call' AND status='queued' AND json_extract(payload,'$.participantId')=?", taskId, p.id)), attempts: all("SELECT * FROM call_attempts WHERE task_id=? AND task_revision=? AND provider<>'sarvam-inbound'", taskId, t.revision) });
+    if (action.type === 'call_supplier') {
+      queueCall(taskId, action.participantId, action.purpose, { ...(action.questionId ? { questionId: action.questionId } : {}) });
+      plan(taskId);
+    }
+    else if (get("SELECT 1 FROM actions WHERE task_id=? AND type='call' AND status='queued'", taskId)) return;
     else if (action.type === 'block') block(taskId, action.reason);
     else if (action.type === 'complete') {
       state(taskId, 'Completed');
@@ -230,11 +276,103 @@ export function openDb(path, config = {}) {
     } else {
       if (t.state !== 'Needs you') event(taskId, 'owner_needed', action.type === 'request_answer' ? 'A supplier needs your answer.' : 'Choose an offer, ask for a better offer, or revise the request.');
       state(taskId, 'Needs you');
-      if (action.type === 'request_approval') notify(taskId, `${taskId}:r${t.revision}:decision:${v.offers.length}`, `Kairos needs your decision. ${link(t)}`);
+      if (['request_approval','review_quotes'].includes(action.type)) {
+        enqueue(taskId, 'think', `${taskId}:r${t.revision}:think:${offerFingerprint(v)}`, { fingerprint: offerFingerprint(v) });
+        notify(taskId, `${taskId}:r${t.revision}:decision:${v.offers.length}`, `Kairos needs your decision. ${link(t)}`);
+      }
     }
+  }
+  function offerFingerprint(v) { return hash(json(v.offers.filter(o => o.validity === 'current' && o.task_revision === v.task.revision).map(o => [o.id, o.version]).sort())); }
+  function gatedTime(p, time) {
+    return p.source === 'research' && !/24\s*(hours|hrs|x\s*7|\/\s*7)/i.test(p.note || '') && !(config.ALLOW_NUMBERS || '').split(',').some(n => n.trim() && lastTen(n) === lastTen(p.phone)) ? callingTime(config.RESEARCH_CALL_HOURS, time) : time;
+  }
+  function gateEvent(taskId, p, due) {
+    const time = new Date(due).toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata', hour: 'numeric', minute: '2-digit' });
+    event(taskId, 'calling_hours', `${p.name} will be called at ${time}; it is outside calling hours now.`, { participantId: p.id, dueAt: due });
+  }
+  function insertContact(taskId, input, source, permitted) {
+    const number = indianPhone(input.phone); check(number, 'Use a valid Indian mobile or landline number', 400);
+    const existing = all('SELECT * FROM participants WHERE task_id=?', taskId).find(p => lastTen(p.phone) === lastTen(number));
+    if (existing) {
+      if (permitted) run("UPDATE participants SET permitted=1,source='owner',consent='Owner explicitly supplied this contact.' WHERE id=?", existing.id);
+      return existing.id;
+    }
+    const participantId = id();
+    run('INSERT INTO participants(id,task_id,name,phone,ordinal,permitted,disclosures,consent,source,source_url,note) VALUES(?,?,?,?,?,?,?,?,?,?,?)', participantId, taskId, text(input.name, 'contact name', 120), number,
+      get('SELECT coalesce(max(ordinal),-1)+1 n FROM participants WHERE task_id=?', taskId).n, +permitted, json({ budget: task(taskId).discloseBudget }), permitted ? 'Owner explicitly supplied this contact.' : 'Research candidate; owner permission required.', source, typeof input.sourceUrl === 'string' ? input.sourceUrl.slice(0, 2000) : null, typeof input.note === 'string' ? input.note.slice(0, 500) : null);
+    return participantId;
   }
   const db = {
     sql, close: () => sql.close(), task, attempt, participant: participantId => get('SELECT * FROM participants WHERE id=?', participantId),
+    researchResult(action, candidates) {
+      db.finishAction(action.id);
+      if (!get('SELECT 1 FROM tasks WHERE id=?', action.task_id)) return;
+      const t = task(action.task_id);
+      if (t.stopped || t.revision !== action.task_revision || t.state !== 'Needs you') return;
+      for (const candidate of (Array.isArray(candidates) ? candidates : []).slice(0, 5)) {
+        if (!candidate || !indianPhone(candidate.phone) || typeof candidate.name !== 'string' || !candidate.name.trim() || candidate.name.length > 120) continue;
+        insertContact(t.id, candidate, 'research', false);
+      }
+      const count = get("SELECT count(*) n FROM participants WHERE task_id=? AND source='research' AND permitted=0", t.id).n;
+      event(t.id, 'research', count ? `Kairos found ${count} possible suppliers. Choose who it may call.` : 'Kairos could not find suppliers automatically. Add a name and number to continue.');
+    },
+    adviceResult(action, advice) {
+      db.finishAction(action.id);
+      if (!get('SELECT 1 FROM tasks WHERE id=?', action.task_id)) return;
+      const t = task(action.task_id), v = db.view(t.id);
+      if (t.stopped || t.revision !== action.task_revision || offerFingerprint(v) !== action.payload.fingerprint) return;
+      const result = validateAdvice(advice, v, advice?.source === 'rules' ? 'rules' : 'codex');
+      run('UPDATE tasks SET advice=?,updated_at=? WHERE id=?', json(result), now(), t.id);
+    },
+    contacts(taskId, input) {
+      const t = task(taskId); allowed(t);
+      check(['Needs you','Working','Blocked'].includes(t.state), 'Contacts cannot be changed during confirmation');
+      const permit = list(input.permit || [], 'permit'), add = list(input.add || [], 'add'), names = [];
+      for (const participantId of permit) {
+        const p = get('SELECT * FROM participants WHERE id=? AND task_id=?', participantId, taskId);
+        check(p, 'Unknown supplier', 400);
+        run("UPDATE participants SET permitted=1,consent='Owner explicitly selected this supplier.' WHERE id=?", p.id);
+        names.push(p.name);
+      }
+      for (const p of add) { const participantId = insertContact(taskId, p, 'owner', true); names.push(db.participant(participantId).name); }
+      check(get('SELECT 1 FROM participants WHERE task_id=? AND permitted=1', taskId), 'Choose or add at least one supplier');
+      if (names.length) event(taskId, 'contact_permission', `Owner gave permission to contact: ${[...new Set(names)].join(', ')}.`);
+      state(taskId, 'Working'); plan(taskId);
+      return { taskId, state: task(taskId).state };
+    },
+    identify(input) {
+      const digits = lastTen(input.phone);
+      if (digits.length !== 10) return { role: 'customer' };
+      const cutoff = new Date(Date.now() - Number(config.TASK_TTL_HOURS || 24) * 3600_000).toISOString();
+      const p = all(`SELECT p.* FROM participants p JOIN tasks t ON t.id=p.task_id
+        WHERE t.stopped=0 AND t.state NOT IN ('Confirmed','Completed','Stopped') AND t.created_at>=?
+        AND NOT EXISTS(SELECT 1 FROM offers o WHERE o.task_id=t.id AND o.participant_id=p.id AND o.task_revision=t.revision AND o.validity='current')
+        ORDER BY t.created_at DESC,t.rowid DESC,p.ordinal`, cutoff).find(p => lastTen(p.phone) === digits);
+      if (!p) {
+        // A returning customer hears only a state-level summary: caller ID is weak proof, so no prices or supplier details.
+        const mine = all('SELECT id,owner_phone FROM tasks WHERE stopped=0 AND created_at>=? ORDER BY created_at DESC,rowid DESC', cutoff).find(r => lastTen(r.owner_phone) === digits);
+        if (!mine) return { role: 'customer' };
+        const o = task(mine.id), v = db.view(o.id), found = all("SELECT count(*) AS n FROM participants WHERE task_id=? AND source='research' AND permitted=0", o.id)[0].n;
+        const open = get('SELECT q.text,p.name FROM questions q JOIN participants p ON p.id=q.participant_id WHERE q.task_id=? AND q.answer IS NULL ORDER BY q.created_at LIMIT 1', o.id);
+        const next = get("SELECT due_at FROM actions WHERE task_id=? AND type='call' AND status='queued' ORDER BY due_at LIMIT 1", o.id);
+        const offers = v.offers.filter(x => x.validity === 'current').length;
+        const detail = o.state === 'Needs you' ? (open ? `${open.name} asked: ${open.text} Answer on your link.` : found ? `I found ${found} possible suppliers. Open your link to choose who I may call.` : offers ? `${offers} offer${offers > 1 ? 's are' : ' is'} in. Open your link to decide.` : 'Something needs your decision on your link.')
+          : o.state === 'Working' ? `I am contacting suppliers.${next && next.due_at > Date.now() ? ` The next call is planned for ${new Date(next.due_at).toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit', timeZone: 'Asia/Kolkata' })}.` : ''}`
+          : o.state === 'Blocked' ? `I am stuck: ${o.blocked_reason || 'no supplier could be reached'}`
+          : o.state === 'Awaiting confirmation' ? 'You approved the terms and I am waiting for the supplier to confirm.'
+          : o.state === 'Confirmed' ? 'The supplier accepted the arrangement.' : o.state === 'Completed' ? 'Your comparison is ready on your link.' : `Status: ${o.state}.`;
+        return { role: 'owner', ownerTaskId: o.id, status_summary: `Request: ${o.outcome} ${detail}` };
+      }
+      const t = task(p.task_id), attemptId = id(), key = `${t.id}:inbound:${attemptId}`;
+      enqueue(t.id, 'inbound', key, { participantId: p.id });
+      const action = get('SELECT id FROM actions WHERE action_key=?', key);
+      db.finishAction(action.id);
+      run('INSERT INTO call_attempts(id,task_id,task_revision,participant_id,action_id,provider,purpose,status,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)', attemptId, t.id, t.revision, p.id, action.id, 'sarvam-inbound', 'collect_offer', 'connected', '{}', now());
+      event(t.id, 'inbound', `${p.name} called Kairos back. Caller ID is not authority to make a commitment.`, { attemptId });
+      const result = { role: 'supplier', taskId: t.id, attemptId, supplierName: p.name, request_summary: t.outcome, hard_requirements: json(t.hardConstraints), deadline: t.deadline || '', owner_answers: json(all('SELECT text,answer FROM questions WHERE task_id=? AND participant_id=? AND task_revision=? AND answer IS NOT NULL', t.id, p.id, t.revision)) };
+      if (t.discloseBudget) result.budget_max = t.budgetMax === null ? '' : String(t.budgetMax);
+      return result;
+    },
     // Hard-deletes tasks older than the TTL with every row that references them. Events stay append-only while their task exists.
     purgeExpired(ttlHours) {
       const ids = all('SELECT id FROM tasks WHERE created_at < ?', new Date(Date.now() - ttlHours * 3600e3).toISOString()).map(r => r.id);
@@ -251,7 +389,7 @@ export function openDb(path, config = {}) {
       check(['quote','appointment','reschedule'].includes(input.type), 'Invalid task type', 400);
       check(['information','arrangement'].includes(input.mode), 'Invalid completion mode', 400);
       const brief = { language: text(input.language || 'English', 'language', 100), type: input.type, mode: input.type === 'quote' ? 'information' : input.mode,
-        outcome: text(input.outcome, 'outcome'), hardConstraints: list(input.hardConstraints || [], 'hardConstraints'), preferences: list(input.preferences || [], 'preferences'),
+        outcome: text(input.outcome, 'outcome'), supplierKind: input.supplierKind ? text(input.supplierKind, 'supplierKind', 500) : null, location: input.location ? text(input.location, 'location', 500) : null, hardConstraints: list(input.hardConstraints || [], 'hardConstraints'), preferences: list(input.preferences || [], 'preferences'),
         deadline: input.deadline || null, timezone: text(input.timezone || 'Asia/Kolkata', 'timezone', 100), budgetMax: money(input.budgetMax, 'budgetMax'),
         discloseBudget: input.discloseBudget === true, mayCounter: input.mayCounter === true, unresolved: list(input.unresolved || [], 'unresolved') };
       if (brief.deadline) check(Number.isFinite(Date.parse(brief.deadline)), 'Deadline must be an ISO date/time', 400);
@@ -264,7 +402,7 @@ export function openDb(path, config = {}) {
       const taskId = id();
       const slug = brief.outcome.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24) || 'task';
       run('INSERT INTO tasks(id,subdomain,owner_phone,brief,state,arrangement,simulated,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)', taskId, `${slug}-${taskId.slice(0, 8)}`, phone(input.ownerPhone), json(brief), 'Draft', arrangement ? json(arrangement) : null, +!config.SARVAM_API_KEY, now(), now());
-      contacts.forEach((p, index) => run('INSERT INTO participants(id,task_id,name,phone,ordinal,permitted,disclosures,consent) VALUES(?,?,?,?,?,1,?,?)', id(), taskId, text(p.name, 'contact name', 120), phone(p.phone), index, json({ budget: brief.discloseBudget }), 'Owner supplied this contact; permission becomes active on brief confirmation.'));
+      contacts.filter((p, index) => contacts.findIndex(other => lastTen(other.phone) === lastTen(p.phone)) === index).forEach((p, index) => run('INSERT INTO participants(id,task_id,name,phone,ordinal,permitted,disclosures,consent) VALUES(?,?,?,?,?,1,?,?)', id(), taskId, text(p.name, 'contact name', 120), indianPhone(p.phone) || phone(p.phone), index, json({ budget: brief.discloseBudget }), 'Owner supplied this contact; permission becomes active on brief confirmation.'));
       event(taskId, 'draft', 'Draft created. No calls are authorised until you confirm the brief.');
       return { taskId };
     },
@@ -272,7 +410,14 @@ export function openDb(path, config = {}) {
       const t = task(taskId);
       if (t.state !== 'Draft') return { taskId, state: t.state };
       check(!t.unresolved.length, 'Resolve every uncertain fact before confirming the brief');
-      check(get('SELECT 1 FROM participants WHERE task_id=? AND permitted=1', taskId), 'At least one permitted contact is required');
+      const hasContacts = get('SELECT 1 FROM participants WHERE task_id=? AND permitted=1', taskId);
+      check(hasContacts || t.supplierKind, 'At least one permitted contact or supplierKind is required');
+      if (!hasContacts) {
+        state(taskId, 'Needs you'); event(taskId, 'brief_confirmed', 'Owner confirmed the brief. Supplier research does not authorise calls.');
+        notify(taskId, `${taskId}:initial`, `Kairos: follow your task and respond securely here: ${link(t)}`);
+        enqueue(taskId, 'research', `${taskId}:r${t.revision}:research`, {});
+        return { taskId, state: 'Needs you', research: true };
+      }
       state(taskId, 'Working'); event(taskId, 'brief_confirmed', 'Owner confirmed the brief and permission to contact the listed suppliers.');
       notify(taskId, `${taskId}:initial`, `Kairos: follow your task and respond securely here: ${link(t)}`);
       plan(taskId); return { taskId, state: task(taskId).state };
@@ -287,18 +432,24 @@ export function openDb(path, config = {}) {
       if (!t.stopped && t.state === 'Needs you') currentAction = question ? { type: 'question', question } : { type: 'approval', offers: currentOffers.filter(o => o.suitable).map(o => ({ id: o.id, version: o.version })), text: 'Approving authorises Kairos to seek supplier acceptance of exactly these terms. It does not make a payment.' };
       const notifications = all('SELECT id,kind,status,provider_id,error,retry_status,created_at FROM notifications WHERE task_id=? AND kind<>? ORDER BY created_at', taskId, 'otp');
       const attempts = all('SELECT a.id,a.participant_id,a.purpose,a.status,a.duration,a.failure_reason,a.notes,a.created_at,p.name AS supplier FROM call_attempts a JOIN participants p ON p.id=a.participant_id WHERE a.task_id=? ORDER BY a.created_at', taskId).map(a => ({ ...a, notes: parse(a.notes) }));
-      const { owner_phone, brief, arrangement, outcome_record, layout, ...publicTask } = t;
-      return { task: { ...publicTask, notifications, attempts, maskedPhone: `••••${owner_phone.slice(-4)}` }, layout, currentAction, offers, questions,
+      const contacts = all('SELECT id,name,phone,permitted,source,source_url,note FROM participants WHERE task_id=? ORDER BY ordinal', taskId).map(p => ({ ...p, phone: `••••${p.phone.slice(-4)}` }));
+      const needsSuppliers = !contacts.length || contacts.some(p => p.source === 'research' && !p.permitted);
+      if (!contacts.some(p => p.permitted) && t.state === 'Needs you') currentAction = { type: 'suppliers', text: 'Choose suppliers Kairos may call, or add a name and number.' };
+      const { owner_phone, brief, arrangement, outcome_record, layout: storedLayout, ...publicTask } = t;
+      const layout = storedLayout.filter(b => b.type !== 'suppliers');
+      if (needsSuppliers) layout.splice(2, 0, { type: 'suppliers', props: {} });
+      return { task: { ...publicTask, notifications, attempts, maskedPhone: `••••${owner_phone.slice(-4)}` }, layout, contacts, currentAction, offers, questions,
         events: all('SELECT * FROM events WHERE task_id=? ORDER BY id', taskId).map(e => ({ ...e, data: parse(e.data), simulated: !!e.simulated })), outcome: t.outcomeRecord,
         uploads: all('SELECT id,filename,content_type,size,created_at FROM uploads WHERE task_id=? ORDER BY created_at', taskId), simulated: t.simulated };
     },
-    // Supplier asked to be called later. Kairos calls back itself; the supplier cannot reach this task by phoning in.
+    // Supplier asked to be called later; inbound requests can queue the callback immediately.
     callback(input) {
       const { a, t, p } = source(input);
       const minutes = Math.min(720, Math.max(1, Number(input.minutes) || 10)), at = Date.now() + minutes * 60_000;
       if (a.callback_at) return { callbackAt: new Date(a.callback_at).toISOString() };
       run('UPDATE call_attempts SET callback_at=? WHERE id=?', at, a.id);
       event(t.id, 'callback_requested', `${p.name} asked to be called back${input.when ? ` (${text(input.when, 'when', 200)})` : ''}. Kairos will call again in about ${minutes} minutes.`, { attemptId: a.id, callbackAt: at });
+      if (a.provider === 'sarvam-inbound') { state(t.id, 'Working'); plan(t.id); }
       return { callbackAt: new Date(at).toISOString() };
     },
     question(input) {
@@ -330,11 +481,16 @@ export function openDb(path, config = {}) {
       const prior = get('SELECT * FROM offers WHERE task_id=? AND participant_id=? ORDER BY version DESC LIMIT 1', t.id, p.id);
       if (prior && prior.terms === json(terms) && prior.task_revision === a.task_revision) return { offerId: prior.id, offerVersion: prior.version };
       const offerId = prior?.id || id(), version = (prior?.version || 0) + 1;
-      const stale = a.task_revision !== t.revision || t.stopped || !p.permitted;
+      const stale = a.task_revision !== t.revision || t.stopped || (!p.permitted && a.provider !== 'sarvam-inbound');
       const eventId = event(t.id, 'offer', `${p.name} supplied offer version ${version}${stale ? ' from an obsolete conversation; recheck required' : ''}.`, { offerId, version, attemptId: a.id });
       run('INSERT INTO offers(id,version,task_id,task_revision,participant_id,attempt_id,terms,validity,event_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)', offerId, version, t.id, a.task_revision, p.id, a.id, json(terms), stale ? 'recheck' : 'current', eventId, now());
+      if (!stale) {
+        run('UPDATE tasks SET advice=NULL WHERE id=?', t.id);
+        run('UPDATE call_attempts SET callback_done=1 WHERE task_id=? AND participant_id=? AND task_revision=?', t.id, p.id, t.revision);
+        run("UPDATE actions SET status='cancelled',updated_at=? WHERE task_id=? AND type='call' AND status='queued' AND json_extract(payload,'$.participantId')=? AND json_extract(payload,'$.callbackOf') IS NOT NULL", now(), t.id, p.id);
+      }
       // Cancel every queued confirmation for older versions; an already dispatched call must recheck authority.
-      run("UPDATE actions SET status='cancelled',updated_at=? WHERE task_id=? AND type='call' AND status='queued' AND json_extract(payload,'purpose')='confirm' AND json_extract(payload,'offerId')=?", now(), t.id, offerId);
+      run("UPDATE actions SET status='cancelled',updated_at=? WHERE task_id=? AND type='call' AND status='queued' AND json_extract(payload,'$.purpose')='confirm' AND json_extract(payload,'$.offerId')=?", now(), t.id, offerId);
       if (!stale && !['Needs reconciliation','Draft'].includes(t.state)) {
         if (['Confirmed','Awaiting required action'].includes(t.state)) { state(t.id, 'Needs you'); event(t.id, 'changed_terms', 'Supplier changed terms after acceptance. The recorded agreement remains evidence; review this new version.'); }
         else state(t.id, 'Working');
@@ -346,7 +502,7 @@ export function openDb(path, config = {}) {
       const t = task(taskId); allowed(t);
       const o = offerRow(input.offerId); check(o.task_id === taskId && o.task_revision === t.revision && o.validity === 'current', 'Offer is not current');
       check(t.state === 'Needs you', 'Wait for current calls to finish before requesting a counteroffer');
-      queueCall(taskId, o.participant_id, 'counter', { offerId: o.id, offerVersion: o.version });
+      queueCall(taskId, o.participant_id, 'counter', { offerId: o.id, offerVersion: o.version, counterAsk: t.advice?.counterOfferId === o.id ? t.advice.counterAsk : null });
       return { state: task(taskId).state };
     },
     approve(taskId, input, ownerPhone) {
@@ -382,6 +538,7 @@ export function openDb(path, config = {}) {
     },
     acceptance(input) {
       const { a, t, p } = source(input, true);
+      check(a.provider !== 'sarvam-inbound', 'Inbound caller ID is not authority: acceptance requires Kairos’s outbound confirmation call', 403);
       check(typeof input.accepted === 'boolean', 'accepted must be boolean', 400);
       const o = offerRow(input.offerId, input.offerVersion);
       check(o.task_id === t.id && o.participant_id === p.id, 'Acceptance source does not match offer supplier', 403);
@@ -419,16 +576,17 @@ export function openDb(path, config = {}) {
     revise(taskId, changes) {
       const t = task(taskId); check(!t.stopped, 'A stopped task cannot be resumed; create a new task');
       check(changes && typeof changes === 'object' && !Array.isArray(changes) && Object.keys(changes).length, 'Provide changes', 400);
-      const keys = ['outcome','hardConstraints','preferences','deadline','timezone','budgetMax','discloseBudget','mayCounter','unresolved'];
+      const keys = ['outcome','hardConstraints','preferences','deadline','timezone','budgetMax','discloseBudget','mayCounter','unresolved','supplierKind','location'];
       check(Object.keys(changes).every(k => keys.includes(k)), 'Only request details and permissions can be revised', 400);
       const brief = { ...parse(t.brief), ...changes };
+      for (const key of ['supplierKind','location']) if (brief[key] != null) text(brief[key], key, 500);
       text(brief.outcome, 'outcome'); text(brief.timezone, 'timezone'); money(brief.budgetMax, 'budgetMax');
       for (const key of ['hardConstraints','preferences','unresolved']) list(brief[key], key);
       check(typeof brief.mayCounter === 'boolean' && typeof brief.discloseBudget === 'boolean', 'Permissions must be booleans', 400);
       if (brief.deadline) check(Number.isFinite(Date.parse(brief.deadline)), 'Invalid deadline', 400);
       const nextState = t.state === 'Needs reconciliation' ? t.state : brief.unresolved.length ? 'Draft' : 'Working';
-      run('UPDATE tasks SET brief=?,revision=revision+1,state=?,blocked_reason=NULL,updated_at=? WHERE id=?', json(brief), nextState, now(), taskId);
-      run("UPDATE actions SET status='cancelled' WHERE task_id=? AND type='call' AND status='queued'", taskId);
+      run('UPDATE tasks SET brief=?,advice=NULL,revision=revision+1,state=?,blocked_reason=NULL,updated_at=? WHERE id=?', json(brief), nextState, now(), taskId);
+      run("UPDATE actions SET status='cancelled' WHERE task_id=? AND (type='call' OR kind IN ('research','think')) AND status='queued'", taskId);
       event(taskId, 'revised', `Request revised to revision ${t.revision + 1}. Existing offers need rechecking; previous approvals are invalid.`, { changes });
       plan(taskId); return { revision: t.revision + 1 };
     },
@@ -448,7 +606,7 @@ export function openDb(path, config = {}) {
     stop(taskId) {
       const t = task(taskId); if (t.stopped) return { state: t.state };
       run("UPDATE tasks SET stopped=1,state='Stopped',updated_at=? WHERE id=?", now(), taskId);
-      run("UPDATE actions SET status='cancelled' WHERE task_id=? AND status='queued' AND type IN ('call','notify')", taskId);
+      run("UPDATE actions SET status='cancelled' WHERE task_id=? AND status='queued' AND (type IN ('call','notify') OR kind IN ('research','think'))", taskId);
       run("UPDATE notifications SET status='cancelled',error='Unsent notification stopped by owner' WHERE task_id=? AND status='queued'", taskId);
       event(taskId, 'stopped', 'Owner stopped unsent work. In-flight calls and previously accepted agreements are preserved; no cancellation is claimed.');
       return { state: 'Stopped' };
@@ -467,7 +625,7 @@ export function openDb(path, config = {}) {
       run("UPDATE actions SET status='done',error=NULL,updated_at=? WHERE id=?", now(), a.action_id);
       event(a.task_id, 'call_completed', `${db.participant(a.participant_id).name}: call ${payload.status}${payload.failure_reason ? ` (${payload.failure_reason})` : ''}.`, { attemptId: a.id });
       // Not picking up is not a refusal: try that supplier once more shortly, within the per-task call cap.
-      if (['no_answer', 'busy'].includes(payload.status) && a.purpose === 'collect_offer' && get('SELECT count(*) AS n FROM call_attempts WHERE task_id=? AND participant_id=?', a.task_id, a.participant_id).n < 2) {
+      if (['no_answer', 'busy'].includes(payload.status) && a.purpose === 'collect_offer' && get('SELECT count(*) AS n FROM call_attempts WHERE task_id=? AND participant_id=? AND provider<>\'sarvam-inbound\'', a.task_id, a.participant_id).n < 2) {
         const at = Date.now() + Number(config.RETRY_MINUTES ?? 3) * 60_000;
         run('UPDATE call_attempts SET callback_at=? WHERE id=?', at, a.id);
         event(a.task_id, 'callback_requested', `${db.participant(a.participant_id).name} did not answer. Kairos will try once more in about ${Number(config.RETRY_MINUTES ?? 3)} minutes.`, { attemptId: a.id, callbackAt: at });
@@ -524,21 +682,28 @@ export function openDb(path, config = {}) {
       const action = get("SELECT * FROM actions WHERE status='queued' AND due_at<=? ORDER BY id LIMIT 1", Date.now());
       if (!action) return null;
       run("UPDATE actions SET status='in_flight',updated_at=? WHERE id=? AND status='queued'", now(), action.id);
-      return { ...action, payload: parse(action.payload) };
+      return { ...action, type: action.kind || action.type, payload: parse(action.payload) };
     },
     prepareCall(action) {
       const t = task(action.task_id), payload = action.payload;
       if (t.stopped || t.revision !== action.task_revision || ['Draft','Needs reconciliation','Blocked','Confirmed','Completed','Awaiting required action'].includes(t.state)) { db.finishAction(action.id, 'cancelled'); return null; }
       const p = get('SELECT * FROM participants WHERE id=? AND task_id=? AND permitted=1', payload.participantId, t.id);
       check(p, 'Contact permission is missing');
+      const due = gatedTime(p, Date.now());
+      if (due > Date.now()) {
+        run("UPDATE actions SET status='queued',due_at=? WHERE id=?", due, action.id); gateEvent(t.id, p, due); plan(t.id); return null;
+      }
+      if (get(`SELECT 1 FROM call_attempts WHERE task_id=? AND provider<>'sarvam-inbound' AND status IN ${activeAttempt}`, t.id)) {
+        run("UPDATE actions SET status='queued',due_at=? WHERE id=?", Date.now() + 1000, action.id); return null;
+      }
       if (payload.purpose === 'confirm' && !db.authority(t.id, payload.offerId, payload.offerVersion).ok) { db.finishAction(action.id, 'cancelled'); state(t.id, 'Needs you'); return null; }
       if (payload.purpose === 'counter') check(t.mayCounter && !get("SELECT 1 FROM call_attempts WHERE task_id=? AND participant_id=? AND purpose='counter'", t.id, p.id), 'Counteroffer authority expired');
-      if (get('SELECT count(*) AS n FROM call_attempts WHERE task_id=?', t.id).n >= maxAttempts) { db.finishAction(action.id, 'cancelled'); block(t.id, `The ${maxAttempts}-call limit is exhausted. Start a new task with confirmed details to continue.`); return null; }
-      check(!get(`SELECT 1 FROM call_attempts WHERE task_id=? AND status IN ${activeAttempt}`, t.id), 'A call is already in flight');
+      if (get('SELECT count(*) AS n FROM call_attempts WHERE task_id=? AND provider<>\'sarvam-inbound\'', t.id).n >= maxAttempts) { db.finishAction(action.id, 'cancelled'); block(t.id, `The ${maxAttempts}-call limit is exhausted. Start a new task with confirmed details to continue.`); return null; }
+      check(!get(`SELECT 1 FROM call_attempts WHERE task_id=? AND provider<>'sarvam-inbound' AND status IN ${activeAttempt}`, t.id), 'A call is already in flight');
       const attemptId = id();
       run('INSERT INTO call_attempts(id,task_id,task_revision,participant_id,action_id,provider,purpose,status,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)', attemptId, t.id, t.revision, p.id, action.id, config.SARVAM_API_KEY ? 'sarvam' : 'simulated', payload.purpose, 'dispatching', json(payload), now());
       event(t.id, 'calling', `Calling ${p.name}.`, { attemptId, purpose: payload.purpose });
-      return { task: t, participant: p, purpose: payload.purpose, attemptId, answers: all('SELECT text,answer FROM questions WHERE task_id=? AND participant_id=? AND task_revision=? AND answer IS NOT NULL', t.id, p.id, t.revision), offer: payload.offerId ? offerRow(payload.offerId, payload.offerVersion) : null };
+      return { task: t, participant: p, purpose: payload.purpose, counterAsk: payload.counterAsk || null, attemptId, answers: all('SELECT text,answer FROM questions WHERE task_id=? AND participant_id=? AND task_revision=? AND answer IS NOT NULL', t.id, p.id, t.revision), offer: payload.offerId ? offerRow(payload.offerId, payload.offerVersion) : null };
     },
     saveVariables(attemptId, variables) { run('UPDATE call_attempts SET variables=? WHERE id=?', json(variables), attemptId); },
     dispatched(attemptId, result) {
@@ -583,7 +748,10 @@ export function openDb(path, config = {}) {
     },
     recover() {
       const pending = all("SELECT * FROM actions WHERE status='in_flight'");
-      for (const action of pending) db.uncertainAction(action, 'Process ended while action was in flight');
+      for (const action of pending) {
+        if (['research','think'].includes(action.kind)) run("UPDATE actions SET status='queued' WHERE id=?", action.id);
+        else db.uncertainAction(action, 'Process ended while action was in flight');
+      }
       for (const t of all("SELECT id FROM tasks WHERE state IN ('Working','Needs you') AND stopped=0")) plan(t.id);
     }
   };
@@ -593,7 +761,7 @@ export function openDb(path, config = {}) {
     const delivered = payload.event === 'sms:delivered';
     run('UPDATE notifications SET status=?,error=? WHERE id=?', delivered ? 'delivered' : 'failed', delivered ? null : `Phone reported SMS failure${payload.payload.reason ? `: ${String(payload.payload.reason).slice(0, 200)}` : ''}`, notification.id);
   }
-  for (const name of ['setLayout','createDraft','confirmBrief','callback','retry','question','answer','offer','counter','approve','acceptance','revise','stop','sarvamWebhook','smsWebhook','requestOtp','verifyOtp','addUpload','claim','prepareCall','saveVariables','dispatched','dispatchFailed','notificationResult','finishAction','uncertainAction','recover']) {
+  for (const name of ['researchResult','adviceResult','contacts','identify','setLayout','createDraft','confirmBrief','callback','retry','question','answer','offer','counter','approve','acceptance','revise','stop','sarvamWebhook','smsWebhook','requestOtp','verifyOtp','addUpload','claim','prepareCall','saveVariables','dispatched','dispatchFailed','notificationResult','finishAction','uncertainAction','recover']) {
     const fn = db[name]; db[name] = (...args) => atomic(() => fn(...args));
   }
   return db;
