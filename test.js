@@ -905,3 +905,18 @@ test('owner may approve a fully priced quote that is over budget; the warnings t
   assert.match((await h.view(taskId, cookie)).events.find(e => e.kind === 'approved').text, /Approved despite: .*exceeds the ₹1000 budget/);
   assert.equal(h.app.db.authority(taskId, o.offerId, 1).ok, true);
 });
+
+test('conditions already in the approved terms do not hold back confirmation; a new condition at acceptance does', async t => {
+  for (const [added, expected] of [['all inclusive', 'Confirmed'], ['bring your own box', 'Awaiting required action']]) {
+    const h = await harness(t, { SIM_DELAY_MS: '600000' }), taskId = await h.create({ budgetMax: 9000, contacts: [{ name: 'Ryan', phone: '+910000000001' }] });
+    await h.ok('/tools/confirm-brief', { taskId });
+    const attempt = async purpose => { let a; for (let i = 0; i < 300 && !(a = h.app.db.sql.prepare('SELECT * FROM call_attempts WHERE task_id=? AND purpose=? AND provider_attempt_id IS NOT NULL').get(taskId, purpose)); i++) await sleep(10); return a; };
+    const a = await attempt('collect_offer');
+    const o = await h.ok('/tools/offer', { taskId, attemptId: a.id, spec: 'cake', basePrice: '5000', fees: '0', taxes: '0', deposit: '0', upfront: '0', conditions: 'all inclusive' });
+    await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, { attempt_id: a.provider_attempt_id, status: 'connected' });
+    await h.ok(`/api/tasks/${taskId}/approve`, { offerId: o.offerId, offerVersion: 1 }, await h.login(taskId));
+    const c = await attempt('confirm');
+    await h.ok('/tools/acceptance', { taskId, attemptId: c.id, offerId: o.offerId, offerVersion: '1', accepted: 'true', conditions: added });
+    assert.equal(h.app.db.task(taskId).state, expected, added);
+  }
+});

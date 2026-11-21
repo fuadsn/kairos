@@ -653,7 +653,10 @@ export function openDb(path, config = {}) {
         run("UPDATE actions SET status='cancelled' WHERE task_id=? AND status='queued' AND type IN ('call','simulate')", t.id);
         event(t.id, 'reconciliation', 'Supplier acceptance conflicts with current authority. It is preserved as evidence; cancellation has not been confirmed.', { reason: authority.reason, evidence });
       } else {
-        const prerequisites = [...o.terms.conditions, ...conditions];
+        // Conditions already in the approved terms are part of what was agreed, not something outstanding.
+        // Only a condition the supplier adds while accepting, or money due before the service, holds confirmation back.
+        const agreed = new Set(o.terms.conditions.map(c => c.trim().toLowerCase()));
+        const prerequisites = conditions.filter(c => !agreed.has(c.trim().toLowerCase()) && !/^(none|no|nil|nothing|no conditions?|all inclusive)\.?$/i.test(c.trim()));
         if (o.terms.deposit > 0) prerequisites.push(`Owner must pay mandatory deposit of ₹${o.terms.deposit}; payment has not been verified.`);
         if (o.terms.upfront > 0) prerequisites.push(`Owner must pay ₹${o.terms.upfront} upfront; payment has not been verified.`);
         state(t.id, prerequisites.length ? 'Awaiting required action' : 'Confirmed');
