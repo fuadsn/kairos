@@ -609,9 +609,24 @@ test('returning customer hears a state-level status; a 24-hour business found by
   let v; for (let i = 0; i < 300 && !((v = h.app.db.view(taskId)).contacts?.length >= 2); i++) await sleep(10);
   const who = await h.ok('/tools/identify', { phone: '09999900000' });
   assert.equal(who.role, 'owner'); assert.equal(who.ownerTaskId, taskId); assert.match(who.status_summary, /found 2 possible suppliers/);
-  assert.ok(!/₹|\d{4,}/.test(who.status_summary), 'no prices or numbers in a caller-ID status');
   const cookie = await h.login(taskId);
   await h.ok(`/api/tasks/${taskId}/contacts`, { permit: v.contacts.map(c => c.id) }, cookie);
   let first; for (let i = 0; i < 300 && !(first = h.app.db.sql.prepare('SELECT p.name FROM call_attempts a JOIN participants p ON p.id=a.participant_id WHERE a.task_id=?').get(taskId)); i++) await sleep(10);
   assert.equal(first?.name, 'Night Bakes');
+});
+
+test('open question keeps Needs you while a re-call is queued; demo supplier replaces research; returning customer can hear quote details', async t => {
+  const h = await harness(t, { SIM_DELAY_MS: '600000', DEMO_SUPPLIERS: 'Ryan, +910000000009' });
+  const { taskId } = await h.ok('/tools/draft', brief({ ownerPhone: '+919999900001', contacts: [], supplierKind: 'bakery', location: 'Kochi' }));
+  assert.deepEqual((await h.ok('/tools/confirm-brief', { taskId })).research, undefined);
+  let a; for (let i = 0; i < 300 && !(a = h.app.db.sql.prepare('SELECT a.*,p.name FROM call_attempts a JOIN participants p ON p.id=a.participant_id WHERE a.task_id=? AND a.provider_attempt_id IS NOT NULL').get(taskId)); i++) await sleep(10);
+  assert.equal(a.name, 'Ryan');
+  await h.ok('/tools/question', { taskId, attemptId: a.id, text: 'Which flavour?' });
+  await h.ok('/tools/callback', { taskId, attemptId: a.id, when: 'later', minutes: '30' });
+  await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, { attempt_id: a.provider_attempt_id, status: 'connected' });
+  assert.ok(h.app.db.sql.prepare("SELECT 1 FROM actions WHERE task_id=? AND type='call' AND status='queued'").get(taskId), 're-call queued');
+  assert.equal(h.app.db.task(taskId).state, 'Needs you');
+  await h.ok('/tools/offer', { taskId, attemptId: a.id, spec: 'cake', basePrice: '900', fees: '100', taxes: '0', deposit: '0', upfront: '200' });
+  const who = await h.ok('/tools/identify', { phone: '+919999900001' });
+  assert.match(who.status_summary, /only if the caller asks: Quotes so far: Ryan: total 1000 rupees, 200 upfront/);
 });

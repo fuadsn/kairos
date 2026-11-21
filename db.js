@@ -244,7 +244,8 @@ export function openDb(path, config = {}) {
     const requested = Math.max(Date.now(), payload.dueAt || 0), due = gatedTime(p, requested);
     enqueue(taskId, 'call', key, { participantId, purpose, ...payload }, due);
     if (due > requested) gateEvent(taskId, p, due);
-    state(taskId, purpose === 'confirm' ? 'Awaiting confirmation' : 'Working');
+    const openQuestion = get('SELECT 1 FROM questions WHERE task_id=? AND task_revision=? AND answer IS NULL', taskId, t.revision);
+    state(taskId, purpose === 'confirm' ? 'Awaiting confirmation' : openQuestion ? 'Needs you' : 'Working');
     if (payload.questionId) run('UPDATE questions SET resumed=1 WHERE id=?', payload.questionId);
     event(taskId, 'call_queued', `${purpose === 'confirm' ? 'Seeking exact-term confirmation from' : purpose === 'counter' ? 'Asking for a better offer from' : 'Preparing to call'} ${p.name}.`, { participantId, purpose });
   }
@@ -361,7 +362,10 @@ export function openDb(path, config = {}) {
           : o.state === 'Blocked' ? `I am stuck: ${o.blocked_reason || 'no supplier could be reached'}`
           : o.state === 'Awaiting confirmation' ? 'You approved the terms and I am waiting for the supplier to confirm.'
           : o.state === 'Confirmed' ? 'The supplier accepted the arrangement.' : o.state === 'Completed' ? 'Your comparison is ready on your link.' : `Status: ${o.state}.`;
-        return { role: 'owner', ownerTaskId: o.id, status_summary: `Request: ${o.outcome} ${detail}` };
+        const quotes = v.offers.filter(x => x.validity === 'current' && x.task_revision === o.revision).map(x => `${x.supplier}: ${x.total == null ? 'total not known yet' : `total ${x.total} rupees`}${x.terms.upfront ? `, ${x.terms.upfront} upfront` : ''}${x.suitable ? '' : ` (${x.reasons[0]})`}`);
+        const contacted = all('SELECT DISTINCT p.name FROM call_attempts a JOIN participants p ON p.id=a.participant_id WHERE a.task_id=?', o.id).map(r => r.name);
+        const details = [quotes.length ? `Quotes so far: ${quotes.join('; ')}.` : '', contacted.length ? `Suppliers contacted: ${contacted.join(', ')}.` : ''].filter(Boolean).join(' ');
+        return { role: 'owner', ownerTaskId: o.id, status_summary: `Request: ${o.outcome} ${detail}${details ? ` Details, only if the caller asks: ${details}` : ''}`.slice(0, 1200) };
       }
       const t = task(p.task_id), attemptId = id(), key = `${t.id}:inbound:${attemptId}`;
       enqueue(t.id, 'inbound', key, { participantId: p.id });

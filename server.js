@@ -188,6 +188,8 @@ export async function startServer(options = {}) {
         const input = coerce(await readJson(req));
         res.on('finish', () => { if (res.statusCode >= 400) console.error(`[tool rejected] ${url.pathname} ${res.statusCode} keys=${Object.keys(input).join(',')}`); });
         if (url.pathname === '/tools/draft') {
+          // DEMO_SUPPLIERS ("Name, +91…; Name, +91…") are the owner's own test contacts: used when the caller names no supplier, and called straight away.
+          if (!(input.contacts || []).length && config.DEMO_SUPPLIERS) input.contacts = coerce({ contacts: config.DEMO_SUPPLIERS }).contacts;
           const result = db.createDraft(input);
           db.setLayout(result.taskId, await layoutFor({ ...db.task(result.taskId), contacts: input.contacts || [] }));
           return respond(res, 201, result);
