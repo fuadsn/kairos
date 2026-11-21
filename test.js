@@ -317,3 +317,20 @@ test('supplier asks to be called later: a re-call is scheduled instead of blocki
   assert.ok(queued && queued.due_at > Date.now() + 29 * 60_000, 'callback call queued for later');
   assert.equal(h.app.db.task(taskId).state, 'Working');
 });
+
+test('no answer schedules one automatic retry; owner can ask to call again after a block', async t => {
+  const h = await harness(t, { SIM_DELAY_MS: '600000', RETRY_MINUTES: '5' }), taskId = await h.create({ contacts: [{ name: 'Printer A', phone: '+910000000001' }] });
+  await h.ok('/tools/confirm-brief', { taskId });
+  const dispatched = async n => { let rows; for (let i = 0; i < 300 && (rows = h.app.db.sql.prepare('SELECT * FROM call_attempts WHERE task_id=? AND provider_attempt_id IS NOT NULL ORDER BY created_at').all(taskId)).length < n; i++) await sleep(10); return rows[n - 1]; };
+  const first = await dispatched(1);
+  await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, { attempt_id: first.provider_attempt_id, status: 'no_answer' });
+  const q = h.app.db.sql.prepare("SELECT * FROM actions WHERE task_id=? AND type='call' AND status='queued'").get(taskId);
+  assert.ok(q.due_at > Date.now() + 4 * 60_000); assert.equal(h.app.db.task(taskId).state, 'Working');
+  h.app.db.sql.prepare('UPDATE actions SET due_at=0 WHERE id=?').run(q.id);
+  const second = await dispatched(2);
+  await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, { attempt_id: second.provider_attempt_id, status: 'no_answer' });
+  assert.equal(h.app.db.task(taskId).state, 'Blocked');
+  const cookie = await h.login(taskId);
+  assert.deepEqual(await h.ok(`/api/tasks/${taskId}/retry`, {}, cookie), { retried: 1 });
+  assert.ok(await dispatched(3)); assert.equal(h.app.db.task(taskId).state, 'Working');
+});

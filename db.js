@@ -432,6 +432,19 @@ export function openDb(path, config = {}) {
       event(taskId, 'revised', `Request revised to revision ${t.revision + 1}. Existing offers need rechecking; previous approvals are invalid.`, { changes });
       plan(taskId); return { revision: t.revision + 1 };
     },
+    // Owner asks to try unreached suppliers again: re-call every permitted contact that has no current offer, one after another.
+    retry(taskId) {
+      const t = task(taskId); allowed(t);
+      check(['Blocked', 'Working'].includes(t.state), 'Calls can only be retried while the task is working or blocked');
+      const rows = all(`SELECT a.* FROM call_attempts a WHERE a.task_id=? AND a.task_revision=? AND a.purpose='collect_offer'
+        AND a.created_at=(SELECT max(created_at) FROM call_attempts WHERE task_id=a.task_id AND participant_id=a.participant_id)
+        AND NOT EXISTS(SELECT 1 FROM offers o WHERE o.task_id=a.task_id AND o.participant_id=a.participant_id AND o.task_revision=a.task_revision)`, taskId, t.revision);
+      check(rows.length, 'There is no supplier left to call again');
+      for (const a of rows) run('UPDATE call_attempts SET callback_at=?,callback_done=0 WHERE id=?', Date.now(), a.id);
+      run('UPDATE tasks SET state=?,blocked_reason=NULL,updated_at=? WHERE id=?', 'Working', now(), taskId);
+      event(taskId, 'retry', 'Owner asked Kairos to call again.');
+      plan(taskId); return { retried: rows.length };
+    },
     stop(taskId) {
       const t = task(taskId); if (t.stopped) return { state: t.state };
       run("UPDATE tasks SET stopped=1,state='Stopped',updated_at=? WHERE id=?", now(), taskId);
@@ -453,6 +466,12 @@ export function openDb(path, config = {}) {
       run('UPDATE call_attempts SET provider_attempt_id=?,status=?,completed_at=?,duration=?,failure_reason=?,notes=? WHERE id=?', payload.attempt_id, payload.status, now(), typeof payload.duration === 'number' ? payload.duration : null, payload.failure_reason || null, json({ transcript: payload.interaction_transcript || [], finalAgentVariables: payload.final_agent_variables || {} }), a.id);
       run("UPDATE actions SET status='done',error=NULL,updated_at=? WHERE id=?", now(), a.action_id);
       event(a.task_id, 'call_completed', `${db.participant(a.participant_id).name}: call ${payload.status}${payload.failure_reason ? ` (${payload.failure_reason})` : ''}.`, { attemptId: a.id });
+      // Not picking up is not a refusal: try that supplier once more shortly, within the per-task call cap.
+      if (['no_answer', 'busy'].includes(payload.status) && a.purpose === 'collect_offer' && get('SELECT count(*) AS n FROM call_attempts WHERE task_id=? AND participant_id=?', a.task_id, a.participant_id).n < 2) {
+        const at = Date.now() + Number(config.RETRY_MINUTES ?? 3) * 60_000;
+        run('UPDATE call_attempts SET callback_at=? WHERE id=?', at, a.id);
+        event(a.task_id, 'callback_requested', `${db.participant(a.participant_id).name} did not answer. Kairos will try once more in about ${Number(config.RETRY_MINUTES ?? 3)} minutes.`, { attemptId: a.id, callbackAt: at });
+      }
       // Transcripts and final variables are evidence only; they never grant authority.
       const t = task(a.task_id);
       if (t.state === 'Blocked' && t.blocked_reason?.startsWith('Dispatch outcome unknown')) state(t.id, 'Working');
@@ -574,7 +593,7 @@ export function openDb(path, config = {}) {
     const delivered = payload.event === 'sms:delivered';
     run('UPDATE notifications SET status=?,error=? WHERE id=?', delivered ? 'delivered' : 'failed', delivered ? null : `Phone reported SMS failure${payload.payload.reason ? `: ${String(payload.payload.reason).slice(0, 200)}` : ''}`, notification.id);
   }
-  for (const name of ['setLayout','createDraft','confirmBrief','callback','question','answer','offer','counter','approve','acceptance','revise','stop','sarvamWebhook','smsWebhook','requestOtp','verifyOtp','addUpload','claim','prepareCall','saveVariables','dispatched','dispatchFailed','notificationResult','finishAction','uncertainAction','recover']) {
+  for (const name of ['setLayout','createDraft','confirmBrief','callback','retry','question','answer','offer','counter','approve','acceptance','revise','stop','sarvamWebhook','smsWebhook','requestOtp','verifyOtp','addUpload','claim','prepareCall','saveVariables','dispatched','dispatchFailed','notificationResult','finishAction','uncertainAction','recover']) {
     const fn = db[name]; db[name] = (...args) => atomic(() => fn(...args));
   }
   return db;

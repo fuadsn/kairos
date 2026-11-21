@@ -144,6 +144,7 @@ export async function startServer(options = {}) {
         if (req.method === 'GET' && !operation) return respond(res, 200, db.view(taskId));
         if (req.method !== 'POST') fail('Route not found', 404);
         if (operation === 'stop') return respond(res, 200, db.stop(taskId));
+        if (operation === 'retry') return respond(res, 200, db.retry(taskId));
         if (operation === 'upload') {
           const contentType = String(req.headers['content-type'] || '').split(';')[0];
           const extensions = { 'application/pdf': '.pdf', 'image/png': '.png', 'image/jpeg': '.jpg' };
