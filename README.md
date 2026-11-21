@@ -1,4 +1,4 @@
-# Hermes
+# Kairos
 
 Version 1 · 21 November 2026 · Track 2 Beyond English · Product name to be decided
 
