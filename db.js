@@ -284,6 +284,11 @@ export function openDb(path, config = {}) {
       }
     }
   }
+  // One spoken sentence for a set of terms; an unstated charge is said as "not stated", never as zero.
+  function termsSentence(terms) {
+    const amount = v => v == null ? 'not stated' : `${v} rupees`, spec = typeof terms.spec === 'string' ? terms.spec : json(terms.spec);
+    return `${spec}; price ${amount(terms.basePrice)}, fees ${amount(terms.fees)}, taxes ${amount(terms.taxes)}, upfront ${amount(terms.upfront)}${terms.deposit ? `, deposit ${terms.deposit} rupees` : ''}${terms.deadline ? `, by ${terms.deadline}` : ''}${terms.conditions?.length ? `. Conditions: ${terms.conditions.join('; ')}` : ''}.`;
+  }
   function approvalBlocker(terms, fit) {
     if (fit.total === null) return 'The full price is not known yet. Ask the supplier for the missing charges first.';
     if (Math.max(terms.upfront || 0, terms.deposit || 0) > fit.total) return 'The upfront amount is more than the total. Ask the supplier to correct the quote first.';
@@ -809,7 +814,18 @@ export function openDb(path, config = {}) {
       const attemptId = id();
       run('INSERT INTO call_attempts(id,task_id,task_revision,participant_id,action_id,provider,purpose,status,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)', attemptId, t.id, t.revision, p.id, action.id, config.SARVAM_API_KEY ? 'sarvam' : 'simulated', payload.purpose, 'dispatching', json(payload), now());
       event(t.id, 'calling', `Calling ${p.name}.`, { attemptId, purpose: payload.purpose });
-      return { task: t, participant: p, purpose: payload.purpose, counterAsk: payload.counterAsk || null, attemptId, answers: all('SELECT text,answer FROM questions WHERE task_id=? AND participant_id=? AND task_revision=? AND answer IS NOT NULL', t.id, p.id, t.revision), offer: payload.offerId ? offerRow(payload.offerId, payload.offerVersion) : null };
+      // What already happened with this supplier, in plain words, so a later call does not start from zero.
+      const earlier = all("SELECT status,purpose,callback_at,created_at FROM call_attempts WHERE task_id=? AND participant_id=? AND id<>? ORDER BY created_at", t.id, p.id, attemptId);
+      const quoted = get('SELECT terms,version FROM offers WHERE task_id=? AND participant_id=? ORDER BY version DESC LIMIT 1', t.id, p.id);
+      const asked = all('SELECT text,answer FROM questions WHERE task_id=? AND participant_id=? ORDER BY created_at', t.id, p.id);
+      const lastSpoke = earlier.filter(e => e.status === 'connected').at(-1), qt = quoted && parse(quoted.terms);
+      const history = [
+        lastSpoke ? `You spoke to them ${Math.max(1, Math.round((Date.now() - Date.parse(lastSpoke.created_at)) / 60000))} minutes ago.` : earlier.length ? 'Earlier calls were not answered.' : '',
+        earlier.some(e => e.callback_at) ? 'They asked to be called back.' : '',
+        qt ? `They quoted: ${termsSentence(qt)}` : '',
+        ...asked.map(q => `They asked: "${q.text}"${q.answer === null ? ' (customer has not answered yet).' : ` Customer's answer: "${q.answer}".`}`)
+      ].filter(Boolean).join(' ');
+      return { task: t, participant: p, purpose: payload.purpose, counterAsk: payload.counterAsk || null, attemptId, history, approvedSentence: payload.offerId ? termsSentence(offerRow(payload.offerId, payload.offerVersion).terms) : '', answers: all('SELECT text,answer FROM questions WHERE task_id=? AND participant_id=? AND task_revision=? AND answer IS NOT NULL', t.id, p.id, t.revision), offer: payload.offerId ? offerRow(payload.offerId, payload.offerVersion) : null };
     },
     saveVariables(attemptId, variables) { run('UPDATE call_attempts SET variables=? WHERE id=?', json(variables), attemptId); },
     dispatched(attemptId, result) {

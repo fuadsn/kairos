@@ -920,3 +920,17 @@ test('conditions already in the approved terms do not hold back confirmation; a 
     assert.equal(h.app.db.task(taskId).state, expected, added);
   }
 });
+
+test('a later call to the same supplier carries what was said before, in plain words', async t => {
+  const h = await harness(t, { SIM_DELAY_MS: '600000' }), taskId = await h.create({ budgetMax: 9000, contacts: [{ name: 'Ryan', phone: '+910000000001' }] });
+  await h.ok('/tools/confirm-brief', { taskId });
+  const attempt = async purpose => { let a; for (let i = 0; i < 300 && !(a = h.app.db.sql.prepare('SELECT * FROM call_attempts WHERE task_id=? AND purpose=? AND provider_attempt_id IS NOT NULL').get(taskId, purpose)); i++) await sleep(10); return a; };
+  const first = await attempt('collect_offer');
+  assert.equal(JSON.parse(first.variables).call_history, '');
+  const o = await h.ok('/tools/offer', { taskId, attemptId: first.id, spec: '1 kg cake', basePrice: '5000', fees: '0', taxes: '0', deposit: '0', upfront: '0', conditions: 'all inclusive' });
+  await h.ok(`/webhooks/sarvam?token=${WEBHOOK_SECRET}`, { attempt_id: first.provider_attempt_id, status: 'connected' });
+  await h.ok(`/api/tasks/${taskId}/approve`, { offerId: o.offerId, offerVersion: 1 }, await h.login(taskId));
+  const v = JSON.parse((await attempt('confirm')).variables);
+  assert.match(v.call_history, /You spoke to them \d+ minutes ago\. They quoted: 1 kg cake; price 5000 rupees, fees 0 rupees/);
+  assert.match(v.approved_terms, /^1 kg cake; price 5000 rupees/);
+});
